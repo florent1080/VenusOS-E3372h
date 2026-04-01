@@ -1,6 +1,6 @@
 #!/usr/bin/python3 -u
 """
-dbus-modem-e3372.py — Venus OS D-Bus modem service for Huawei E3372h (NCM mode)
+dbus-modem-e3372.py â€” Venus OS D-Bus modem service for Huawei E3372h (NCM mode)
 Publishes modem info on com.victronenergy.modem for the Venus OS UI.
 Manages NCM data connection via AT^NDISDUP instead of PPP.
 """
@@ -226,6 +226,17 @@ class ModemService:
                 if '+CPIN:' in line:
                     status = line.split(':')[1].strip()
                     self.dbus['/SimStatus'] = 1000 if status == 'READY' else 1001
+        else:
+            # AT+CPIN? returned error (CME ERROR: 10 = no SIM inserted)
+            self.dbus['/SimStatus'] = 0
+            self.dbus['/SignalStrength'] = 0
+            self.dbus['/NetworkName'] = ''
+            self.dbus['/NetworkType'] = ''
+            self.dbus['/RegStatus'] = 0
+            self.dbus['/Connected'] = 0
+            self.dbus['/IP'] = ''
+            self.dbus['/Roaming'] = False
+            return
 
         # Signal strength
         r = self.modem.at('AT+CSQ')
