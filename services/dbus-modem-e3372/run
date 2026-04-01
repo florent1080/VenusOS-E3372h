@@ -1,0 +1,3 @@
+#!/bin/sh
+exec 2>&1
+exec /data/VenusOS-E3372h/dbus-modem-e3372.py -s /dev/$tty

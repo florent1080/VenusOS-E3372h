@@ -1,0 +1,7 @@
+v1.0
+    initial release
+    Huawei E3372h (NCM mode, USB PID 12d1:1506) support for Venus OS
+    D-Bus modem service (com.victronenergy.modem) with signal, network, IMEI
+    NCM data connection via AT^NDISDUP + DHCP on wwan0
+    udev rules for serial-starter and hotplug
+    configurable APN via /data/e3372-config.conf

@@ -1,0 +1,81 @@
+#!/bin/bash
+
+# VenusOS-E3372h setup script
+# Huawei E3372h (NCM mode) modem integration for Venus OS
+#
+# This script installs/uninstalls:
+#   - D-Bus modem service (via SetupHelper service mechanism)
+#   - Replacement start-modem.sh for serial-starter (via FileSets)
+#   - udev rules for hotplug
+#   - NCM connect script
+#   - Default config file (preserves existing)
+
+packageDir="$(dirname "$(realpath "$0")")"
+
+# custom install/uninstall actions needed
+# standardPromptAndActions='yes'  # NOT used — we have custom actions
+
+#### following line incorporates helper resources into this script
+source "/data/SetupHelper/HelperResources/IncludeHelpers"
+#### end of lines to include helper resources
+
+#### running manually and target just install or uninstall
+if [ $scriptAction == 'NONE' ] ; then
+    echo
+    echo "This package adds Huawei E3372h (NCM mode) modem support to Venus OS"
+    echo
+    scriptAction=$(promptForAction)
+fi
+
+if [ $scriptAction == 'INSTALL' ] ; then
+    logMessage "installing VenusOS-E3372h"
+
+    # Install udev rules
+    cp "$packageDir/udev-e3372.rules" /data/udev-e3372.rules
+    ln -sf /data/udev-e3372.rules /etc/udev/rules.d/99-e3372.rules
+    udevadm control --reload-rules 2>/dev/null
+    logMessage "udev rules installed"
+
+    # Install NCM connect script
+    cp "$packageDir/e3372_connect.sh" /data/e3372_connect.sh
+    chmod +x /data/e3372_connect.sh
+    logMessage "NCM connect script installed"
+
+    # Install config file (only if not already present — preserve user edits)
+    if [ ! -f /data/e3372-config.conf ] ; then
+        cp "$packageDir/e3372-config.conf" /data/e3372-config.conf
+        logMessage "default config installed (/data/e3372-config.conf)"
+    else
+        logMessage "config file already exists, preserved"
+    fi
+
+    # Make dbus service executable
+    chmod +x "$packageDir/dbus-modem-e3372.py"
+
+    # Load modem kernel modules
+    modprobe huawei_cdc_ncm 2>/dev/null
+    modprobe cdc_ncm 2>/dev/null
+
+fi
+
+if [ $scriptAction == 'UNINSTALL' ] ; then
+    logMessage "uninstalling VenusOS-E3372h"
+
+    # Remove udev rules
+    rm -f /etc/udev/rules.d/99-e3372.rules
+    rm -f /data/udev-e3372.rules
+    udevadm control --reload-rules 2>/dev/null
+    logMessage "udev rules removed"
+
+    # Remove NCM connect script
+    rm -f /data/e3372_connect.sh
+    logMessage "NCM connect script removed"
+
+    # Note: /data/e3372-config.conf is NOT removed (user data)
+    logMessage "config file preserved (/data/e3372-config.conf)"
+fi
+
+# Let SetupHelper handle:
+#   INSTALL_FILES — replaces start-modem.sh from FileSets
+#   INSTALL_SERVICE — installs dbus-modem-e3372 runit service
+endScript INSTALL_FILES INSTALL_SERVICE

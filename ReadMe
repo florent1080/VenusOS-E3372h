@@ -1,0 +1,36 @@
+VenusOS-E3372h — Huawei E3372h modem support for Venus OS
+
+This package adds full integration of the Huawei E3372h USB modem
+(NCM stick mode, USB PID 12d1:1506) into Venus OS.
+
+Features:
+- D-Bus modem service (com.victronenergy.modem) with:
+  Model, IMEI, NetworkName, NetworkType, SignalStrength,
+  Connected, IP, SimStatus, RegStatus, Roaming
+- NCM data connection via AT^NDISDUP + DHCP on wwan0
+- Automatic hotplug: reconnects on USB replug
+- Configurable APN via /data/e3372-config.conf
+- Compatible with serial-starter and Venus OS GUI
+
+Requirements:
+- Venus OS v3.50 or later
+- Huawei E3372h in NCM stick mode (USB PID 12d1:1506)
+- SIM card with data plan
+- SetupHelper package installed
+
+Installation:
+1. Install SetupHelper (if not already present)
+2. Use PackageManager to add this package, or:
+   cd /data
+   git clone https://github.com/flmusic/VenusOS-E3372h.git
+   /data/VenusOS-E3372h/setup install auto
+3. Edit /data/e3372-config.conf with your APN
+4. Reboot or re-run setup
+
+Configuration:
+Edit /data/e3372-config.conf:
+  APN=your.operator.apn
+
+Tested on:
+- Raspberry Pi 3 Model B with Venus OS v3.72
+- Bouygues Telecom (France), APN: mmsbouygtel.com

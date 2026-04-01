@@ -1,0 +1,11 @@
+# Huawei E3372h integration for Venus OS
+# Installed by VenusOS-E3372h package via SetupHelper
+
+# Assign VE_SERVICE=modem so serial-starter launches dbus-modem (UI integration)
+ACTION=="add", SUBSYSTEM=="tty", ENV{ID_BUS}=="usb", ENV{ID_MODEL}=="HUAWEI_MOBILE", ENV{VE_SERVICE}="modem"
+
+# Run NCM connect script when modem net interface appears (after driver loads)
+ACTION=="add", SUBSYSTEM=="net", ENV{ID_USB_DRIVER}=="huawei_cdc_ncm", RUN+="/bin/sh -c 'nohup /data/e3372_connect.sh udev > /dev/null 2>&1 &'"
+
+# When net interface appears for E3372 HiLink mode -> just DHCP
+ACTION=="add", SUBSYSTEM=="net", ATTRS{idVendor}=="12d1", ATTRS{idProduct}=="14dc", RUN+="/bin/sh -c 'sleep 3; udhcpc -i %k -b -q &'"
