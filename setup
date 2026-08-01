@@ -32,25 +32,33 @@ if [ $scriptAction == 'INSTALL' ] ; then
 
     # Install udev rules
     cp "$packageDir/udev-e3372.rules" /data/udev-e3372.rules
+    sed -i 's/\r//g' /data/udev-e3372.rules
     ln -sf /data/udev-e3372.rules /etc/udev/rules.d/99-e3372.rules
     udevadm control --reload-rules 2>/dev/null
     logMessage "udev rules installed"
 
     # Install NCM connect script
     cp "$packageDir/e3372_connect.sh" /data/e3372_connect.sh
+    # Strip CR in case the package was copied from a Windows working tree
+    # (CRLF breaks the shebang on BusyBox: "bad interpreter: /bin/sh^M")
+    sed -i 's/\r//g' /data/e3372_connect.sh
     chmod +x /data/e3372_connect.sh
     logMessage "NCM connect script installed"
 
     # Install config file (only if not already present — preserve user edits)
     if [ ! -f /data/e3372-config.conf ] ; then
         cp "$packageDir/e3372-config.conf" /data/e3372-config.conf
+        sed -i 's/\r//g' /data/e3372-config.conf
         logMessage "default config installed (/data/e3372-config.conf)"
     else
         logMessage "config file already exists, preserved"
     fi
 
     # Make dbus service executable
+    # (run in place from $packageDir by the serial-starter start-modem.sh)
+    sed -i 's/\r//g' "$packageDir/dbus-modem-e3372.py"
     chmod +x "$packageDir/dbus-modem-e3372.py"
+    logMessage "line endings normalized (LF)"
 
     # Load modem kernel modules
     modprobe huawei_cdc_ncm 2>/dev/null
@@ -77,5 +85,14 @@ fi
 
 # Let SetupHelper handle:
 #   INSTALL_FILES — replaces start-modem.sh from FileSets
-#   INSTALL_SERVICE — installs dbus-modem-e3372 runit service
-endScript INSTALL_FILES INSTALL_SERVICE
+#
+# NOTE: this package deliberately installs NO runit service.
+# The modem service is launched by serial-starter, not by runit:
+#   udev (VE_SERVICE=modem) -> serial-starter -> start-modem.sh (FileSet)
+#     -> dbus-modem-e3372.py -s /dev/$tty
+# $tty is set by serial-starter's run-service.sh and is NOT available to a
+# standalone runit service. A services/ entry here would therefore exec
+# "-s /dev/" and respawn-loop, while also fighting the working instance for
+# ownership of the com.victronenergy.modem D-Bus name.
+# Do NOT add INSTALL_SERVICES to the line below.
+endScript INSTALL_FILES
