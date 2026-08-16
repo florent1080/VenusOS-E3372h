@@ -1,3 +1,33 @@
+v1.1
+    Fix: the data session is now watched and re-dialled automatically.
+        The session could drop (operator side) while wwan0 kept its stale
+        address and default route. Nothing detected it and nothing re-dialled,
+        so the GX lost internet until the next reboot.
+    Fix: /Connected no longer forced to 1 by a leftover address on wwan0.
+        AT^NDISSTATQRY is now the only source of truth for the data session.
+        The UI used to report "Internet: Online" with the session closed.
+    Fix: /PPPStatus is now actually published. It was declared once at
+        startup and never written, so the UI showed "Data link (PPP) status:
+        Offline" permanently, including when the connection worked.
+    Fix: e3372_connect.sh no longer opens a serial port. It hardcoded
+        /dev/ttyUSB0, which on a Venus OS install is normally a VE.Direct
+        adapter and not the modem: the AT commands never reached the modem,
+        and the port was switched to 115200 baud under the VE.Direct service.
+        Dialling now belongs solely to dbus-modem-e3372.py, which
+        serial-starter binds to the modem's real tty.
+    Fix: udhcpc no longer runs with -q, so the DHCP client stays resident,
+        renews the lease and restores the address and default route.
+    Fix: e3372_connect.sh takes a lock; it used to race up to three
+        concurrent udhcpc against each other on a single hotplug.
+    Fix: the stale address is flushed before re-dialling, so the old default
+        route can no longer black-hole traffic.
+    Fix: /Settings/Modem/Connect is honoured (connect / hang up on change).
+    Fix: the serial port is reopened after an I/O error instead of leaving
+        the service permanently deaf.
+    New: PROBE_HOST in /data/e3372-config.conf - host pinged periodically to
+        detect a session that is up but no longer passing traffic. Set it
+        empty to disable when the APN filters ICMP.
+
 v1.0
     initial release
     Huawei E3372h (NCM mode, USB PID 12d1:1506) support for Venus OS
