@@ -7,5 +7,7 @@ ACTION=="add", SUBSYSTEM=="tty", ENV{ID_BUS}=="usb", ENV{ID_MODEL}=="HUAWEI_MOBI
 # Run NCM connect script when modem net interface appears (after driver loads)
 ACTION=="add", SUBSYSTEM=="net", ENV{ID_USB_DRIVER}=="huawei_cdc_ncm", RUN+="/bin/sh -c 'nohup /data/e3372_connect.sh udev > /dev/null 2>&1 &'"
 
-# When net interface appears for E3372 HiLink mode -> just DHCP
-ACTION=="add", SUBSYSTEM=="net", ATTRS{idVendor}=="12d1", ATTRS{idProduct}=="14dc", RUN+="/bin/sh -c 'sleep 3; udhcpc -i %k -b -q &'"
+# When net interface appears for E3372 HiLink mode -> just DHCP.
+# No -q: the client must stay resident to renew the lease and to restore the
+# address and default route after a session drop.
+ACTION=="add", SUBSYSTEM=="net", ATTRS{idVendor}=="12d1", ATTRS{idProduct}=="14dc", RUN+="/bin/sh -c 'sleep 3; udhcpc -i %k -b -p /var/run/udhcpc.%k.pid -t 8 -T 3 -A 15 > /dev/null 2>&1 &'"

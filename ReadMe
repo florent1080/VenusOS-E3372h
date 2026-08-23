@@ -8,6 +8,9 @@ Features:
   Model, IMEI, NetworkName, NetworkType, SignalStrength,
   Connected, IP, SimStatus, RegStatus, Roaming
 - NCM data connection via AT^NDISDUP + DHCP on wwan0
+- Watchdog: detects a dropped data session and re-dials it automatically,
+  with exponential backoff (30s to 10min)
+- Resident DHCP client: renews the lease and restores the default route
 - Automatic hotplug: reconnects on USB replug
 - Configurable APN via /data/e3372-config.conf
 - Compatible with serial-starter and Venus OS GUI
@@ -30,6 +33,30 @@ Installation:
 Configuration:
 Edit /data/e3372-config.conf:
   APN=your.operator.apn
+  PROBE_HOST=8.8.8.8     (empty to disable the connectivity check)
+
+PROBE_HOST is pinged every 2 minutes through wwan0. After 3 consecutive
+failures the watchdog re-dials the session, which covers the case where the
+modem still reports the session as up but no traffic gets through. Set
+PROBE_HOST= (empty) if your operator or APN filters ICMP, otherwise the
+watchdog will re-dial for nothing.
+
+Troubleshooting:
+- Service log:  tail -f /var/log/dbus-modem.ttyUSB*/current
+- Link log:     tail -f /var/log/e3372.log
+- Real session state (independent of the UI):
+    cat /dev/cdc-wdm0 & sleep 1
+    printf 'AT^NDISSTATQRY?\r' > /dev/cdc-wdm0
+    sleep 3; kill %1
+  ^NDISSTATQRY: 1 = data session up, 0 = down.
+- An address on wwan0 does NOT mean the session is up: it survives a drop.
+  Check the session state, not the IP address.
+
+Note on serial ports:
+The modem's tty is assigned by serial-starter and is NOT necessarily
+/dev/ttyUSB0 - on a Venus OS install the low numbers are usually VE.Direct
+adapters. Only dbus-modem-e3372.py talks to the modem, on the port
+serial-starter hands it. Do not add scripts that open a hardcoded ttyUSB.
 
 Tested on:
 - Raspberry Pi 3 Model B with Venus OS v3.72
