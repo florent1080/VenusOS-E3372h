@@ -25,7 +25,7 @@ import dbus.mainloop.glib
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = '1.1-e3372'
+VERSION = '1.2-e3372'
 
 CONFIG_FILE = '/data/e3372-config.conf'
 IFACE = 'wwan0'
@@ -41,6 +41,13 @@ PROBE_REDIALS_MAX = 3       # give up on the probe after this many futile re-dia
 # CREG stat values that mean "attached to a network"
 REG_HOME = 1
 REG_ROAMING = 5
+
+# Victron PPP_STATUS enum (see dbus-modem's PPP_STATUS IntEnum); the GUI
+# renders 1 as "connecting", so publishing 1 for an established session
+# showed "Data link (PPP) status: connecting" forever.
+PPP_DOWN = 0
+PPP_INIT = 1
+PPP_UP = 2
 
 
 def load_config(path):
@@ -158,6 +165,7 @@ class ModemService:
         self.settings = None
         self.ncm_connected = False
         self.sim_present = True
+        self.identified = False
         # watchdog state
         self.redial_count = 0
         self.next_redial = 0.0
@@ -215,12 +223,13 @@ class ModemService:
             else:
                 self._hangup()
 
-    def _init_modem(self):
-        """Initial modem identification and NCM setup."""
+    def _identify(self):
+        """Modem identification (/Model, /IMEI). Retried from _update until it
+        succeeds: a single AT timeout at startup must not leave both empty
+        forever."""
         r = self.modem.at('AT')
         if r is None:
-            log.error('Modem not responding')
-            return
+            return False
 
         # Model
         r = self.modem.at('AT+CGMM')
@@ -236,6 +245,16 @@ class ModemService:
 
         # Enable numeric error codes
         self.modem.at('AT+CMEE=1')
+
+        self.identified = (self.dbus['/Model'] is not None
+                           and self.dbus['/IMEI'] is not None)
+        return self.identified
+
+    def _init_modem(self):
+        """Initial modem identification and NCM setup."""
+        if not self._identify():
+            log.error('Modem not responding, will retry')
+            return
 
         self._query_ncm()
         if not self.ncm_connected and self._connect_wanted():
@@ -273,6 +292,7 @@ class ModemService:
         """Bring the NCM data session up. Returns True on success."""
         apn = self._apn()
         log.info('NCM dial: APN=%s', apn)
+        self.dbus['/PPPStatus'] = PPP_INIT
 
         self.modem.at('AT+CGDCONT=1,"IP","%s"' % apn)
         time.sleep(0.5)
@@ -290,6 +310,7 @@ class ModemService:
 
         if not self.ncm_connected:
             log.warning('NCM dial failed, session still down')
+            self.dbus['/PPPStatus'] = PPP_DOWN
             return False
 
         log.info('NCM session up, (re)starting DHCP on %s', IFACE)
@@ -300,6 +321,7 @@ class ModemService:
         log.info('NCM hangup')
         self.modem.at('AT^NDISDUP=1,0', timeout=5)
         self.ncm_connected = False
+        self.dbus['/PPPStatus'] = PPP_DOWN
         self._stop_dhcp()
 
     # ---- DHCP client ------------------------------------------------------
@@ -380,7 +402,7 @@ class ModemService:
             self.dbus['/NetworkType'] = ''
             self.dbus['/RegStatus'] = 0
             self.dbus['/Connected'] = 0
-            self.dbus['/PPPStatus'] = 0
+            self.dbus['/PPPStatus'] = PPP_DOWN
             self.dbus['/IP'] = ''
             self.dbus['/Roaming'] = False
             return
@@ -427,7 +449,7 @@ class ModemService:
 
         self.dbus['/IP'] = self._iface_ip()
         self.dbus['/Connected'] = 1 if self.ncm_connected else 0
-        self.dbus['/PPPStatus'] = 1 if self.ncm_connected else 0
+        self.dbus['/PPPStatus'] = PPP_UP if self.ncm_connected else PPP_DOWN
 
     # ---- watchdog ---------------------------------------------------------
 
@@ -539,6 +561,8 @@ class ModemService:
     def _update(self):
         """Periodic update called by GLib."""
         try:
+            if not self.identified:
+                self._identify()
             self._update_status()
             self._watchdog()
         except Exception as e:

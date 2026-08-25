@@ -25,7 +25,7 @@ Installation:
 1. Install SetupHelper (if not already present)
 2. Use PackageManager to add this package, or:
    cd /data
-   git clone https://github.com/flmusic/VenusOS-E3372h.git
+   git clone https://github.com/florent1080/VenusOS-E3372h.git
    /data/VenusOS-E3372h/setup install auto
 3. Edit /data/e3372-config.conf with your APN
 4. Reboot or re-run setup

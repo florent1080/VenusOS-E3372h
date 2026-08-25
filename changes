@@ -1,3 +1,16 @@
+v1.2
+    Fix: /PPPStatus now follows the Victron PPP_STATUS enum (0 down,
+        1 connecting, 2 up). The session-up state was published as 1,
+        which the GUI renders as "Data link (PPP) status: connecting"
+        even with the connection established. 1 is now published only
+        while actually dialling.
+    Fix: modem identification (/Model, /IMEI) is retried from the periodic
+        update until it succeeds. A single AT timeout at startup used to
+        leave both empty until the service was restarted.
+    Cleanup: USB_PID removed from e3372-config.conf - nothing ever read it
+        (the USB PIDs are hardcoded in the udev rules).
+    ReadMe: repository URL corrected (flmusic -> florent1080).
+
 v1.1
     Fix: the data session is now watched and re-dialled automatically.
         The session could drop (operator side) while wwan0 kept its stale
