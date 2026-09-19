@@ -61,6 +61,12 @@ if [ $scriptAction == 'INSTALL' ] ; then
     chmod +x /data/e3372_linkwatch.sh
     logMessage "link watchdog installed"
 
+    # Install the AT query tool (diagnostics on the second AT channel)
+    cp "$packageDir/e3372_at.py" /data/e3372_at.py
+    sed -i 's/\r//g' /data/e3372_at.py
+    chmod +x /data/e3372_at.py
+    logMessage "AT query tool installed"
+
     # Persistent recovery journal
     mkdir -p /data/log/e3372
 
@@ -103,7 +109,7 @@ if [ $scriptAction == 'UNINSTALL' ] ; then
         kill "$(cat /var/run/e3372-linkwatch.pid)" 2>/dev/null
         rm -f /var/run/e3372-linkwatch.pid
     fi
-    rm -f /data/e3372_usb_reset.sh /data/e3372_linkwatch.sh
+    rm -f /data/e3372_usb_reset.sh /data/e3372_linkwatch.sh /data/e3372_at.py
     logMessage "USB reset helper and link watchdog removed"
 
     # Note: /data/e3372-config.conf is NOT removed (user data)

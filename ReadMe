@@ -99,11 +99,13 @@ Troubleshooting:
   Lines are prefixed recovery:, session:, reg:, sim: and signal:.
 - Link log:     tail -f /var/log/e3372.log
 - Ladder state: dbus -y com.victronenergy.modem /Recovery/State GetValue
-- Real session state (independent of the UI):
-    cat /dev/cdc-wdm0 & sleep 1
-    printf 'AT^NDISSTATQRY?\r' > /dev/cdc-wdm0
-    sleep 3; kill %1
+- Ask the modem directly, without disturbing the service (it owns the
+  serial port; /dev/cdc-wdm0 is a second, independent AT channel):
+    /data/e3372_at.py 'AT^NDISSTATQRY?' 'AT+CREG?' 'AT^HCSQ?'
   ^NDISSTATQRY: 1 = data session up, 0 = down.
+  Do NOT write to /dev/cdc-wdm0 with a shell redirection: the driver
+  needs the node opened read/write with the answer read back, so
+  "printf ... > /dev/cdc-wdm0" silently does nothing.
 - An address on wwan0 does NOT mean the session is up: it survives a drop.
   Check the session state, not the IP address.
 
