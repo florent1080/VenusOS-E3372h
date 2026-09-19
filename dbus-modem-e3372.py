@@ -50,6 +50,8 @@ DHCP_PIDFILE = '/var/run/udhcpc.wwan0.pid'
 WDM_DEV = '/dev/cdc-wdm0'
 STATE_FILE = '/run/e3372-recovery.json'
 USB_RESET_HELPER = '/data/e3372_usb_reset.sh'
+LINKWATCH_HELPER = '/data/e3372_linkwatch.sh'
+LINKWATCH_PIDFILE = '/var/run/e3372-linkwatch.pid'
 RECOVERY_LOG_DIR = '/data/log/e3372'
 RECOVERY_LOG = RECOVERY_LOG_DIR + '/recovery.log'
 BOOT_ID_FILE = '/proc/sys/kernel/random/boot_id'
@@ -244,6 +246,7 @@ class Config:
         hosts = cfg.get('PROBE_HOST', '8.8.8.8,1.1.1.1')
         self.probe_hosts = [h.strip() for h in hosts.split(',') if h.strip()]
         self.recovery_level = self._num(cfg.get('RECOVERY_LEVEL'), 4, 0, 4, int)
+        self.linkwatch = str(cfg.get('LINKWATCH', '1')).strip() not in ('0', 'no', 'false')
         self.timescale = self._num(cfg.get('RECOVERY_TIMESCALE'), 1.0, 0.1, 1.0, float)
 
     @staticmethod
@@ -993,6 +996,7 @@ class ModemService:
                                        self.setting_changed, timeout=10)
 
         self.recovery.load(time.monotonic())
+        self._ensure_linkwatch()
 
         if not self.modem.open():
             # Keep running: the port is reopened at every poll and the recovery
@@ -1577,6 +1581,31 @@ class ModemService:
         if err in ('io', 'nodev'):
             return 'impossible'
         return 'refused'
+
+    def _ensure_linkwatch(self):
+        """Start the last-resort link watchdog, detached.
+
+        Every rung of the ladder needs the modem's tty or /dev/cdc-wdm0. Both
+        disappear when the modem leaves the USB bus, and serial-starter then
+        kills this service - so nothing would be left to reset the USB port,
+        which is the one action that brings such a modem back. The helper runs
+        in its own session and survives that, and it re-attaches to the same
+        pidfile, so restarting this service never starts a second one.
+        """
+        if not self.cfg.linkwatch:
+            return
+        try:
+            pid = int((self.sysx.read(LINKWATCH_PIDFILE) or '').strip())
+            if self.sysx.exists('/proc/%d' % pid):
+                log.info('linkwatch already running (pid %d)', pid)
+                return
+        except ValueError:
+            pass
+        if not self.sysx.exists(LINKWATCH_HELPER):
+            log.warning('%s missing, no last-resort link watchdog', LINKWATCH_HELPER)
+            return
+        if self.sysx.spawn_detached([LINKWATCH_HELPER]):
+            log.info('linkwatch started')
 
     def _usb_sysfs_path(self):
         """sysfs directory of the modem's USB device (the one with idVendor)."""

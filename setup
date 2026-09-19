@@ -8,7 +8,7 @@
 #   - Replacement start-modem.sh for serial-starter (via FileSets)
 #   - udev rules for hotplug
 #   - NCM connect script
-#   - USB reset helper (recovery ladder)
+#   - USB reset helper and link watchdog (recovery ladder)
 #   - Default config file (preserves existing)
 
 packageDir="$(dirname "$(realpath "$0")")"
@@ -53,6 +53,14 @@ if [ $scriptAction == 'INSTALL' ] ; then
     chmod +x /data/e3372_usb_reset.sh
     logMessage "USB reset helper installed"
 
+    # Install the last-resort link watchdog (started detached by the service;
+    # it is the only thing that can reset the USB port once the modem's tty is
+    # gone and serial-starter has killed the service)
+    cp "$packageDir/e3372_linkwatch.sh" /data/e3372_linkwatch.sh
+    sed -i 's/\r//g' /data/e3372_linkwatch.sh
+    chmod +x /data/e3372_linkwatch.sh
+    logMessage "link watchdog installed"
+
     # Persistent recovery journal
     mkdir -p /data/log/e3372
 
@@ -90,9 +98,13 @@ if [ $scriptAction == 'UNINSTALL' ] ; then
     rm -f /data/e3372_connect.sh
     logMessage "NCM connect script removed"
 
-    # Remove USB reset helper (the recovery journal in /data/log/e3372 is kept)
-    rm -f /data/e3372_usb_reset.sh
-    logMessage "USB reset helper removed"
+    # Remove the helpers (the recovery journal in /data/log/e3372 is kept)
+    if [ -f /var/run/e3372-linkwatch.pid ] ; then
+        kill "$(cat /var/run/e3372-linkwatch.pid)" 2>/dev/null
+        rm -f /var/run/e3372-linkwatch.pid
+    fi
+    rm -f /data/e3372_usb_reset.sh /data/e3372_linkwatch.sh
+    logMessage "USB reset helper and link watchdog removed"
 
     # Note: /data/e3372-config.conf is NOT removed (user data)
     logMessage "config file preserved (/data/e3372-config.conf)"

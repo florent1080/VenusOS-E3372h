@@ -39,6 +39,8 @@ Edit /data/e3372-config.conf:
   APN=your.operator.apn
   PROBE_HOST=8.8.8.8,1.1.1.1   (comma-separated, empty to disable the check)
   RECOVERY_LEVEL=4             (0 to 4, see below)
+  LINKWATCH=1                  (last-resort USB port reset, see below)
+  LINKWATCH_DOWN_SECONDS=900   (how long the link must be dead first)
   RECOVERY_TIMESCALE=1.0       (tests only: shortens every recovery delay)
 
 PROBE_HOST hosts are pinged every 2 minutes through wwan0; the check passes
@@ -68,6 +70,15 @@ condition clears:
   radio cycle     AT+CFUN=0 then AT+CFUN=1         2
   modem reset     AT+CFUN=1,1 (USB re-enumerates)  3
   USB reset       /data/e3372_usb_reset.sh         4
+
+Every rung needs the modem's tty (or /dev/cdc-wdm0). Both vanish when the
+modem leaves the USB bus, and serial-starter then kills the service - so the
+package also installs a last-resort link watchdog, /data/e3372_linkwatch.sh,
+which the service starts detached so that it outlives it. It does one thing:
+reset the modem's USB port once wwan0 has had no address and no default route
+for LINKWATCH_DOWN_SECONDS (15 min by default), at most once every 30 minutes,
+and never while the data session is alive. Its log is
+/data/log/e3372/linkwatch.log.
 
 A PIN or PUK request, a wrong SIM, or roaming while roaming is not permitted
 are reported but never acted upon. When a whole ladder fails, the next one

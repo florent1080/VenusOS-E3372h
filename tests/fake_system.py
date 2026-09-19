@@ -25,6 +25,7 @@ class FakeSystem:
         self.ip = ''
         self.udhcpc_pid = None
         self.next_pid = 1000
+        self.live_pids = set()
 
     def _t(self):
         return self.clock.monotonic()
@@ -61,6 +62,11 @@ class FakeSystem:
         return True
 
     def exists(self, path):
+        if path.startswith('/proc/'):
+            try:
+                return int(path.split('/')[2]) in self.live_pids
+            except (IndexError, ValueError):
+                return False
         if path == self.tty:
             return not self.modem.died
         if path == '/dev/cdc-wdm0':

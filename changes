@@ -1,4 +1,17 @@
 v1.3
+    New: last-resort link watchdog (/data/e3372_linkwatch.sh), started
+        detached by the service so that it survives the service being
+        killed. Every rung of the ladder needs the modem's tty or
+        /dev/cdc-wdm0; both vanish when the modem leaves the USB bus, and
+        serial-starter then kills the service - so nothing was left to
+        reset the USB port, the one action that brings such a modem back.
+        The watchdog does only that, once wwan0 has had no address and no
+        default route for LINKWATCH_DOWN_SECONDS (15 min by default), at
+        most once every 30 min, and never while the session is alive.
+        LINKWATCH=0 disables it; LINKWATCH_HCI_RESET=1 additionally allows
+        rebinding the USB controller when the modem is not on the bus at
+        all (opt-in: it re-enumerates the other devices of that
+        controller).
     New: recovery ladder for every state in which the modem cannot be
         dialled. The watchdog used to give up silently whenever the modem
         was not registered (CREG 0/2/3/4): a "Registration denied" from the
