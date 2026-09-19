@@ -119,6 +119,24 @@ class DeniedLadderTests(unittest.TestCase):
         self.assertEqual(cmds[:4], ['AT+COPS=2', 'AT+COPS=0', 'AT+CFUN=0', 'AT+CFUN=1'])
         self.assertTrue(b.logs('recovered at rung 2/4 CFUN_CYCLE'))
 
+    def test_radio_off_is_recovered_by_the_cfun_cycle(self):
+        # AT+CFUN=4 (radio off) is how the in-situ test reproduces a total loss
+        # of registration: the SIM stays readable, CREG answers 0, and no
+        # network selection can succeed - only the radio cycle brings it back.
+        b = harness.Bench()
+        b.modem.cfun = 4
+        b.start()
+        b.run(25 * 60)
+        cmds = b.heavy_cmds()
+        self.assertEqual(cmds[:4], ['AT+COPS=2', 'AT+COPS=0', 'AT+CFUN=0', 'AT+CFUN=1'])
+        self.assertTrue(b.logs('recovery: [reg] stuck (CREG 0 not registered)'))
+        self.assertTrue(b.logs('step 1 of COPS_CYCLE is optional, carrying on'))
+        self.assertTrue(b.logs('recovered at rung 2/4 CFUN_CYCLE'), b.logs('recovery:'))
+        self.assertEqual(b.modem.cfun, 1)
+        self.assertEqual(b.dbus('/RegStatus'), 1)
+        self.assertEqual(b.dbus('/Connected'), 1)
+        self.assertEqual(b.modem.reset_count, 0)   # no modem reset was needed
+
     def test_reason_change_and_clear_are_logged(self):
         b = harness.Bench()
         b.modem.creg = 3
