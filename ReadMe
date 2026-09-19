@@ -6,10 +6,14 @@ This package adds full integration of the Huawei E3372h USB modem
 Features:
 - D-Bus modem service (com.victronenergy.modem) with:
   Model, IMEI, NetworkName, NetworkType, SignalStrength,
-  Connected, IP, SimStatus, RegStatus, Roaming
+  Connected, IP, SimStatus, RegStatus, Roaming, PPPStatus,
+  plus Recovery/* (ladder state) and Signal/* (RSRP, SINR, RSRQ)
 - NCM data connection via AT^NDISDUP + DHCP on wwan0
-- Watchdog: detects a dropped data session and re-dials it automatically,
-  with exponential backoff (30s to 10min)
+- Session watchdog: re-dials a dropped data session with exponential
+  backoff (30s to 10min), checks that traffic really flows
+- Recovery ladder: gets the modem back from every state in which it cannot
+  be dialled (see below). The GX itself is never rebooted.
+- SIM PIN entry from the GUI (/Settings/Modem/PIN)
 - Resident DHCP client: renews the lease and restores the default route
 - Automatic hotplug: reconnects on USB replug
 - Configurable APN via /data/e3372-config.conf
@@ -33,17 +37,57 @@ Installation:
 Configuration:
 Edit /data/e3372-config.conf:
   APN=your.operator.apn
-  PROBE_HOST=8.8.8.8     (empty to disable the connectivity check)
+  PROBE_HOST=8.8.8.8,1.1.1.1   (comma-separated, empty to disable the check)
+  RECOVERY_LEVEL=4             (0 to 4, see below)
+  RECOVERY_TIMESCALE=1.0       (tests only: shortens every recovery delay)
 
-PROBE_HOST is pinged every 2 minutes through wwan0. After 3 consecutive
-failures the watchdog re-dials the session, which covers the case where the
-modem still reports the session as up but no traffic gets through. Set
-PROBE_HOST= (empty) if your operator or APN filters ICMP, otherwise the
+PROBE_HOST hosts are pinged every 2 minutes through wwan0; the check passes
+when any of them answers. After 3 consecutive failures the watchdog re-dials
+the session, which covers the case where the modem still reports the session
+as up but no traffic gets through. When three re-dials do not help, the
+recovery ladder cycles the radio once, then suspends the check for 6 hours.
+Set PROBE_HOST= (empty) if your operator or APN filters ICMP, otherwise the
 watchdog will re-dial for nothing.
+
+Recovery ladder:
+The session watchdog only works while the modem is registered on a network.
+Every other state is handled by the recovery ladder, which detects the
+condition, waits a grace period, then escalates rung by rung until the
+condition clears:
+
+  condition                         grace    rungs
+  AT port mute or gone              60s      modem reset, USB reset
+  SIM missing / failed / busy       5min     radio cycle, modem reset, USB reset
+  not registered / denied / unknown 2min     re-selection, radio cycle, modem reset, USB reset
+  searching for a network           5min     same
+  registered but dial keeps failing -        same
+  session up but no traffic         -        radio cycle, then probe suspended 6h
+
+  rung            command                          RECOVERY_LEVEL
+  re-selection    AT+COPS=2 then AT+COPS=0         1
+  radio cycle     AT+CFUN=0 then AT+CFUN=1         2
+  modem reset     AT+CFUN=1,1 (USB re-enumerates)  3
+  USB reset       /data/e3372_usb_reset.sh         4
+
+A PIN or PUK request, a wrong SIM, or roaming while roaming is not permitted
+are reported but never acted upon. When a whole ladder fails, the next one
+waits 15 minutes, then 30, 1 hour, 2 hours, up to 4 hours, forever: the
+watchdog never gives up and never reboots the GX. No more than two modem or
+USB resets are ever issued within 30 minutes. RECOVERY_LEVEL=0 keeps the
+detection and the logs but takes no action.
+
+The modem reset and the USB reset make the modem re-enumerate: the service
+is stopped by serial-starter and restarted on the new tty. The ladder state
+is kept in /run/e3372-recovery.json across that restart.
 
 Troubleshooting:
 - Service log:  tail -f /var/log/dbus-modem.ttyUSB*/current
+  (the tty number can change after a modem reset)
+- Recovery journal (persistent, survives reboots):
+                /data/log/e3372/recovery.log
+  Lines are prefixed recovery:, session:, reg:, sim: and signal:.
 - Link log:     tail -f /var/log/e3372.log
+- Ladder state: dbus -y com.victronenergy.modem /Recovery/State GetValue
 - Real session state (independent of the UI):
     cat /dev/cdc-wdm0 & sleep 1
     printf 'AT^NDISSTATQRY?\r' > /dev/cdc-wdm0
@@ -58,6 +102,11 @@ The modem's tty is assigned by serial-starter and is NOT necessarily
 adapters. Only dbus-modem-e3372.py talks to the modem, on the port
 serial-starter hands it. Do not add scripts that open a hardcoded ttyUSB.
 
+Tests:
+tests/ holds an offline bench (Python unittest, no hardware, no Venus
+libraries needed) that drives the service against a scripted fake modem:
+  python -m unittest discover -s tests -v
+
 Tested on:
+- Raspberry Pi 5 with Venus OS v3.75 (Bouygues Telecom, APN mmsbouygtel.com)
 - Raspberry Pi 3 Model B with Venus OS v3.72
-- Bouygues Telecom (France), APN: mmsbouygtel.com

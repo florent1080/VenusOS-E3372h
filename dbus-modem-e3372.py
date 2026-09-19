@@ -1,19 +1,36 @@
 #!/usr/bin/python3 -u
 """
 dbus-modem-e3372.py - Venus OS D-Bus modem service for Huawei E3372h (NCM mode)
-Publishes modem info on com.victronenergy.modem for the Venus OS UI.
-Manages the NCM data connection via AT^NDISDUP instead of PPP, and keeps it
-alive with a watchdog (re-dial on session loss, persistent DHCP client).
+
+Publishes modem info on com.victronenergy.modem for the Venus OS UI, manages
+the NCM data connection via AT^NDISDUP instead of PPP, and keeps the modem
+usable with two watchdogs:
+
+  - the session watchdog re-dials a dropped data session (exponential
+    backoff) and checks that traffic really flows (ICMP probe);
+  - the recovery ladder handles every state in which the modem cannot be
+    dialled at all: mute AT port, missing or failed SIM, registration lost,
+    denied or stuck, dial refused, session up without traffic. It escalates
+    from a network re-selection to a radio cycle, a modem reset and finally a
+    USB port reset, with an exponential backoff between full ladders.
+
+The GX itself is never rebooted: every recovery action is confined to the
+modem.
 """
 
 import os
 import sys
+import json
 import signal
+import select
+import posixpath
 import time
 import threading
 import subprocess
-import serial
 import logging
+import logging.handlers
+
+import serial
 
 # Venus OS python libraries
 sys.path.insert(1, '/opt/victronenergy/dbus-modem')
@@ -25,68 +42,376 @@ import dbus.mainloop.glib
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = '1.2-e3372'
+VERSION = '1.3-e3372'
 
 CONFIG_FILE = '/data/e3372-config.conf'
 IFACE = 'wwan0'
 DHCP_PIDFILE = '/var/run/udhcpc.wwan0.pid'
+WDM_DEV = '/dev/cdc-wdm0'
+STATE_FILE = '/run/e3372-recovery.json'
+USB_RESET_HELPER = '/data/e3372_usb_reset.sh'
+RECOVERY_LOG_DIR = '/data/log/e3372'
+RECOVERY_LOG = RECOVERY_LOG_DIR + '/recovery.log'
+BOOT_ID_FILE = '/proc/sys/kernel/random/boot_id'
 
 POLL_INTERVAL = 10          # seconds between status polls
 REDIAL_MIN_BACKOFF = 30     # seconds before the first re-dial retry
 REDIAL_MAX_BACKOFF = 600    # ceiling for the exponential backoff
 PROBE_INTERVAL = 120        # seconds between connectivity probes
 PROBE_FAILURES_MAX = 3      # consecutive probe failures before forcing a re-dial
-PROBE_REDIALS_MAX = 3       # give up on the probe after this many futile re-dials
+PROBE_REDIALS_MAX = 3       # futile re-dials before the recovery ladder takes over
+PROBE_SUSPEND = 6 * 3600    # probe suspended this long when nothing restores traffic
+DIAL_TIMEOUT = 30           # seconds for a dial to bring the NCM session up
+DIAL_FAILURES_MAX = 5       # consecutive dial failures before the recovery ladder
+SESSION_STABLE = 60         # seconds of stable session before the backoff is reset
+DHCP_STALE = 60             # seconds without address on a live session before DHCP restart
+DHCP_RESTART_MIN_GAP = 120  # never restart DHCP more often than this
+AT_MUTE_POLLS = 6           # consecutive polls without any AT answer = mute port
+SIGNAL_LOG_INTERVAL = 60    # seconds between periodic signal quality lines
+NAG_INTERVAL = 600          # seconds between repeats of a standing warning
+HEALTHY_RESET_AFTER = 3600  # seconds of health before the ladder counter is cleared
+LADDER_BACKOFF_MIN = 900    # seconds between two full ladders (first)
+LADDER_BACKOFF_MAX = 14400  # ceiling (4 h)
+DESTRUCTIVE_WINDOW = 1800   # no more than DESTRUCTIVE_MAX modem/USB resets per window
+DESTRUCTIVE_MAX = 2
+STEP_GAP = 10               # seconds between the two commands of a cycle rung
+VERIFY_WINDOW = 45          # seconds given to a verification dial
+TICK_ERRORS_MAX = 6         # recovery tick exceptions in a row before a self-reset
+REGISTER_RETRY_FOR = 30     # seconds to retry the D-Bus name registration
 
-# CREG stat values that mean "attached to a network"
-REG_HOME = 1
-REG_ROAMING = 5
+# CREG stat values (3GPP TS 27.007)
+REG_NREG, REG_HOME, REG_SEARCHING, REG_DENIED, REG_UNKNOWN, REG_ROAMING = 0, 1, 2, 3, 4, 5
+REGISTERED = (REG_HOME, REG_ROAMING)
+REG_NAMES = {
+    REG_NREG: 'not registered', REG_HOME: 'home', REG_SEARCHING: 'searching',
+    REG_DENIED: 'denied', REG_UNKNOWN: 'unknown', REG_ROAMING: 'roaming',
+}
 
-# Victron PPP_STATUS enum (see dbus-modem's PPP_STATUS IntEnum); the GUI
-# renders 1 as "connecting", so publishing 1 for an established session
-# showed "Data link (PPP) status: connecting" forever.
+# /SimStatus codes: CME error codes (3GPP TS 27.007 9.2) plus the two Victron
+# values. These are the codes the Venus GUI knows how to display.
+SIM_READY = 1000
+SIM_ERROR = 1001
+SIM_NO_SIM = 10
+SIM_PIN = 11
+SIM_PUK = 12
+SIM_FAIL = 13
+SIM_BUSY = 14
+SIM_WRONG = 15
+SIM_BAD_PASSWD = 16
+CPIN_TEXT = {
+    'READY': SIM_READY, 'SIM PIN': SIM_PIN, 'SIM PUK': SIM_PUK,
+    'PH-SIM PIN': 5, 'PH-FSIM PIN': 6, 'PH-FSIM PUK': 7,
+    'SIM PIN2': 17, 'SIM PUK2': 18,
+    'PH-NET PIN': 40, 'PH-NET PUK': 41, 'PH-NETSUB PIN': 42, 'PH-NETSUB PUK': 43,
+    'PH-SP PIN': 44, 'PH-SP PUK': 45, 'PH-CORP PIN': 46, 'PH-CORP PUK': 47,
+}
+CME_SIM_CODES = (SIM_NO_SIM, SIM_PIN, SIM_PUK, SIM_FAIL, SIM_BUSY, SIM_WRONG, SIM_BAD_PASSWD)
+SIM_NAMES = {
+    SIM_READY: 'ready', SIM_ERROR: 'error', SIM_NO_SIM: 'no SIM', SIM_PIN: 'PIN required',
+    SIM_PUK: 'PUK required', SIM_FAIL: 'SIM failure', SIM_BUSY: 'SIM busy',
+    SIM_WRONG: 'wrong SIM', SIM_BAD_PASSWD: 'wrong PIN',
+}
+SIM_LADDER = (SIM_NO_SIM, SIM_FAIL, SIM_BUSY, SIM_ERROR)  # a modem reset may fix these
+SIM_HUMAN = (SIM_PUK, SIM_WRONG, SIM_BAD_PASSWD)          # nothing automatic can
+
+# Victron PPP_STATUS enum: the GUI renders 1 as "connecting".
 PPP_DOWN = 0
 PPP_INIT = 1
 PPP_UP = 2
 
+# +COPS? access technology
+ACT_NAMES = {0: 'GSM', 1: 'GSM', 2: 'UMTS', 3: 'EDGE', 4: 'HSDPA', 5: 'HSUPA',
+             6: 'HSPA', 7: 'LTE', 8: 'LTE', 9: 'LTE'}
 
-def load_config(path):
-    """Parse a trivial KEY=value config file. Never raises."""
-    cfg = {}
-    try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#') or '=' not in line:
-                    continue
-                key, value = line.split('=', 1)
-                cfg[key.strip()] = value.strip().strip('"').strip("'")
-    except Exception:
-        pass
-    return cfg
+# ---- recovery ladder ---------------------------------------------------------
 
-
-_cfg = load_config(CONFIG_FILE)
-APN = _cfg.get('APN', 'mmsbouygtel.com')
-# Host pinged to verify traffic actually flows. Empty disables the probe, which
-# is the right setting on an APN that filters ICMP.
-PROBE_HOST = _cfg.get('PROBE_HOST', '8.8.8.8')
+RUNG_COPS = 'COPS_CYCLE'    # AT+COPS=2 then AT+COPS=0: fresh network selection
+RUNG_CFUN = 'CFUN_CYCLE'    # AT+CFUN=0 then AT+CFUN=1: radio off/on
+RUNG_RESET = 'CFUN_RESET'   # AT+CFUN=1,1: full modem reset (re-enumerates USB)
+RUNG_USB = 'USB_RESET'      # de-authorize / re-authorize the USB device
+RUNG_MIN_LEVEL = {RUNG_COPS: 1, RUNG_CFUN: 2, RUNG_RESET: 3, RUNG_USB: 4}
+RUNG_DESTRUCTIVE = (RUNG_RESET, RUNG_USB)
+RUNG_STEPS = {RUNG_COPS: 2, RUNG_CFUN: 2, RUNG_RESET: 1, RUNG_USB: 1}
+SETTLE = {RUNG_COPS: 90, RUNG_CFUN: 120, RUNG_RESET: 180, RUNG_USB: 180}
+LADDERS = {
+    'at_mute': [RUNG_RESET, RUNG_USB],
+    'sim':     [RUNG_CFUN, RUNG_RESET, RUNG_USB],
+    'reg':     [RUNG_COPS, RUNG_CFUN, RUNG_RESET, RUNG_USB],
+    'dial':    [RUNG_COPS, RUNG_CFUN, RUNG_RESET, RUNG_USB],
+    'traffic': [RUNG_CFUN],
+}
+GRACE = {'at_mute': 0, 'sim': 300, 'reg': 120, 'reg_searching': 300, 'dial': 0, 'traffic': 0}
 
 log = logging.getLogger()
-logging.basicConfig(format='%(levelname)-8s %(message)s', level=logging.INFO)
+rlog = logging.getLogger('recovery')
 
 modem_settings = {
     'connect': ['/Settings/Modem/Connect', 1, 0, 1],
     'roaming': ['/Settings/Modem/RoamingPermitted', 0, 0, 1],
-    'apn':     ['/Settings/Modem/APN', APN, 0, 0],
+    'apn':     ['/Settings/Modem/APN', '', 0, 0],
+    'pin':     ['/Settings/Modem/PIN', '', 0, 0],
 }
 
 
+# ---- helpers -----------------------------------------------------------------
+
+def fmt_duration(seconds):
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return '%ds' % seconds
+    if seconds < 3600:
+        return '%dm%02ds' % (seconds // 60, seconds % 60)
+    return '%dh%02dm' % (seconds // 3600, (seconds % 3600) // 60)
+
+
+def parse_cme(line):
+    """'+CME ERROR: 10' -> 10, textual errors -> None."""
+    try:
+        return int(line.split(':', 1)[1].strip())
+    except (IndexError, ValueError):
+        return None
+
+
+def _hcsq_scale(v, floor, step, count):
+    """Huawei ^HCSQ encoding: 0 = below floor, 1..count linear, count+1 = above
+    ceiling, 255 = unknown."""
+    if v is None or v == 255:
+        return None
+    if v <= 0:
+        return round(floor, 1)
+    if v > count:
+        return round(floor + step * (count - 1), 1)
+    return round(floor + step * (v - 1), 1)
+
+
+def hcsq_to_dbm(line):
+    """Parse a ^HCSQ response into dBm/dB values. Returns {} when unusable."""
+    try:
+        body = line.split(':', 1)[1].strip()
+        parts = [p.strip().strip('"') for p in body.split(',')]
+        mode = parts[0].upper()
+        vals = []
+        for p in parts[1:]:
+            vals.append(int(p) if p != '' else None)
+    except (IndexError, ValueError):
+        return {}
+    vals += [None] * 4
+    out = {'mode': mode}
+    if mode == 'LTE':
+        out['rssi'] = _hcsq_scale(vals[0], -120, 1, 95)
+        out['rsrp'] = _hcsq_scale(vals[1], -140, 1, 96)
+        out['sinr'] = _hcsq_scale(vals[2], -20, 0.2, 250)
+        out['rsrq'] = _hcsq_scale(vals[3], -19.5, 0.5, 34)
+    elif mode == 'WCDMA':
+        out['rssi'] = _hcsq_scale(vals[0], -120, 1, 95)
+        out['rscp'] = _hcsq_scale(vals[1], -120, 1, 95)
+        out['ecio'] = _hcsq_scale(vals[2], -32, 0.5, 65)
+    elif mode == 'GSM':
+        out['rssi'] = _hcsq_scale(vals[0], -120, 1, 95)
+    return out
+
+
+def fmt_signal(sig, csq=None):
+    if not sig:
+        return 'signal: unknown'
+    mode = sig.get('mode', '?')
+    if mode == 'NOSERVICE':
+        s = 'signal: no service'
+    else:
+        parts = ['signal: %s' % mode]
+        for key, unit in (('rssi', 'dBm'), ('rsrp', 'dBm'), ('rscp', 'dBm'),
+                          ('sinr', 'dB'), ('rsrq', 'dB'), ('ecio', 'dB')):
+            if key in sig:
+                v = sig[key]
+                parts.append('%s=%s' % (key, ('%g%s' % (v, unit)) if v is not None else '?'))
+        s = ' '.join(parts)
+    if csq is not None:
+        s += ' csq=%s' % csq
+    return s
+
+
+class Config:
+    """Trivial KEY=value file. Never raises; every field has a default."""
+
+    def __init__(self, path=CONFIG_FILE, raw=None):
+        cfg = raw if raw is not None else self._read(path)
+        self.apn = cfg.get('APN', '') or 'mmsbouygtel.com'
+        hosts = cfg.get('PROBE_HOST', '8.8.8.8,1.1.1.1')
+        self.probe_hosts = [h.strip() for h in hosts.split(',') if h.strip()]
+        self.recovery_level = self._num(cfg.get('RECOVERY_LEVEL'), 4, 0, 4, int)
+        self.timescale = self._num(cfg.get('RECOVERY_TIMESCALE'), 1.0, 0.1, 1.0, float)
+
+    @staticmethod
+    def _num(value, default, lo, hi, conv):
+        try:
+            return max(lo, min(hi, conv(value)))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _read(path):
+        cfg = {}
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    key, value = line.split('=', 1)
+                    cfg[key.strip()] = value.strip().strip('"').strip("'")
+        except Exception:
+            pass
+        return cfg
+
+
+class SystemShim:
+    """Single point of contact with the OS, so that the test bench can replace
+    it. Every method is tolerant: no exception escapes."""
+
+    def sh(self, cmd):
+        try:
+            return os.system(cmd)
+        except Exception:
+            return -1
+
+    def run(self, argv, timeout=5):
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        except Exception:
+            return None
+
+    def read(self, path):
+        try:
+            with open(path) as f:
+                return f.read()
+        except Exception:
+            return None
+
+    def write_atomic(self, path, text):
+        tmp = path + '.tmp'
+        try:
+            with open(tmp, 'w') as f:
+                f.write(text)
+            os.replace(tmp, path)
+            return True
+        except Exception as e:
+            log.warning('cannot write %s: %s', path, e)
+            return False
+
+    def exists(self, path):
+        return os.path.exists(path)
+
+    def listdir(self, path):
+        try:
+            return os.listdir(path)
+        except Exception:
+            return []
+
+    def realpath(self, path):
+        try:
+            return os.path.realpath(path)
+        except Exception:
+            return path
+
+    def remove(self, path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+    def kill(self, pid, sig=signal.SIGTERM):
+        try:
+            os.kill(pid, sig)
+            return True
+        except Exception:
+            return False
+
+    def pid_cmdline(self, pid):
+        try:
+            with open('/proc/%d/cmdline' % pid, 'rb') as f:
+                return f.read()
+        except Exception:
+            return b''
+
+    def spawn_detached(self, argv):
+        """Start a helper that must survive this process (new session, no
+        inherited descriptors)."""
+        try:
+            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True,
+                             start_new_session=True)
+            return True
+        except Exception as e:
+            log.error('cannot start %s: %s', argv, e)
+            return False
+
+    def ping(self, host, iface):
+        try:
+            r = subprocess.run(['ping', '-c', '1', '-W', '3', '-I', iface, host],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=8)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def boot_id(self):
+        return (self.read(BOOT_ID_FILE) or '').strip()
+
+
+class WdmChannel:
+    """Second AT channel of the E3372h (/dev/cdc-wdm0). Used for the heavy
+    commands of the recovery ladder so that a slow answer never blocks the
+    service and never pollutes the serial port it polls."""
+
+    def __init__(self, dev=WDM_DEV, sysx=None):
+        self.dev = dev
+        self.sysx = sysx or SystemShim()
+
+    def available(self):
+        return self.sysx.exists(self.dev)
+
+    def send(self, cmd, timeout=3.0):
+        """Returns ('ok'|'error'|'timeout'|'nodev', text)."""
+        if not self.available():
+            return 'nodev', ''
+        fd = None
+        try:
+            fd = os.open(self.dev, os.O_RDWR | os.O_NONBLOCK)
+            os.write(fd, (cmd + '\r').encode())
+            buf = b''
+            end = time.monotonic() + timeout
+            while time.monotonic() < end:
+                r, _, _ = select.select([fd], [], [], 0.5)
+                if not r:
+                    continue
+                try:
+                    buf += os.read(fd, 4096)
+                except BlockingIOError:
+                    continue
+                if b'\r\nOK\r\n' in buf or b'\nOK\r' in buf or buf.strip().endswith(b'OK'):
+                    return 'ok', buf.decode(errors='replace')
+                if b'ERROR' in buf:
+                    return 'error', buf.decode(errors='replace')
+            return 'timeout', buf.decode(errors='replace')
+        except Exception as e:
+            log.warning('wdm %s: %s', cmd, e)
+            return 'nodev', ''
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+
+
 class E3372Modem:
-    def __init__(self, dev):
+    def __init__(self, dev, sysx=None, stop_event=None):
         self.dev = dev
         self.ser = None
         self.lock = threading.Lock()
+        self.sysx = sysx or SystemShim()
+        self.stop_event = stop_event or threading.Event()
+        self.last_error = None
 
     def open(self):
         try:
@@ -107,17 +432,39 @@ class E3372Modem:
                 pass
             self.ser = None
 
+    def responded(self):
+        """True when the last command got any answer from the modem (OK, ERROR
+        or CME), False when it timed out or the port is gone."""
+        return self.last_error not in ('timeout', 'io', 'nodev')
+
     def at(self, cmd, timeout=3):
         """Send AT command and return response lines (excluding echo and OK/ERROR).
 
-        Returns None when the command failed or the modem did not answer - the
-        caller must treat None as "unknown", never as "not connected".
+        Returns None when the command failed or the modem did not answer;
+        self.last_error then says why: a CME code (int), 'error',
+        'unsupported', 'timeout', 'io' or 'nodev'. The caller must treat None
+        as "unknown", never as "not connected".
         """
+        self.last_error = None
         with self.lock:
+            if self.stop_event.is_set():
+                self.last_error = 'io'
+                return None
+            # A vanished device node must fail fast, not cost a timeout per call.
+            if not self.sysx.exists(self.dev):
+                self.close()
+                self.last_error = 'nodev'
+                return None
             # The port can die under us (USB glitch, modem reset); reopen it
             # rather than staying broken until the service is restarted.
             if self.ser is None and not self.open():
+                self.last_error = 'io'
                 return None
+            # For Huawei commands only the matching ^XXX: line is a response;
+            # any other ^XXX: line is an unsolicited report.
+            want = None
+            if cmd.startswith('AT^'):
+                want = cmd[2:].split('=')[0].split('?')[0] + ':'
             try:
                 self.ser.reset_input_buffer()
                 self.ser.write((cmd + '\r').encode())
@@ -126,6 +473,9 @@ class E3372Modem:
                 lines = []
                 end_time = time.time() + timeout
                 while time.time() < end_time:
+                    if self.stop_event.is_set():
+                        self.last_error = 'io'
+                        return None
                     if self.ser.in_waiting:
                         raw = self.ser.readline()
                         line = raw.decode(errors='replace').strip()
@@ -135,116 +485,563 @@ class E3372Modem:
                             continue
                         if line == 'OK':
                             return lines
-                        if line == 'ERROR' or line.startswith('+CME ERROR'):
+                        if line == 'ERROR':
+                            self.last_error = 'error'
+                            log.warning('%s -> %s', cmd, line)
+                            return None
+                        if line.startswith('+CME ERROR') or line.startswith('+CMS ERROR'):
+                            code = parse_cme(line)
+                            self.last_error = code if code is not None else 'error'
                             log.warning('%s -> %s', cmd, line)
                             return None
                         if line == 'COMMAND NOT SUPPORT':
+                            self.last_error = 'unsupported'
                             log.warning('%s -> not supported', cmd)
                             return None
-                        # Skip unsolicited Huawei notifications
-                        if line.startswith('^RSSI:') or line.startswith('^HCSQ:'):
-                            continue
-                        if line.startswith('^NDISSTAT:'):
+                        if line.startswith('^'):
+                            if want and line.startswith(want):
+                                lines.append(line)
+                            else:
+                                log.debug('unsolicited: %s', line)
                             continue
                         lines.append(line)
                     else:
                         time.sleep(0.1)
 
                 log.warning('%s -> timeout', cmd)
-                return lines if lines else None
+                if lines:
+                    return lines
+                self.last_error = 'timeout'
+                return None
             except Exception as e:
                 log.error('Serial error on %s: %s', cmd, e)
+                self.last_error = 'io'
                 self.close()
                 return None
 
 
+class Recovery:
+    """State machine of the recovery ladder. Owns no I/O: modem actions go
+    through `actions` (the ModemService), files through `sysx`.
+
+    States: idle -> grace -> rung -> idle | wait -> rung ...
+    """
+
+    def __init__(self, actions, sysx, level=4, timescale=1.0, now=0.0):
+        self.actions = actions
+        self.sysx = sysx
+        self.level = level
+        self.ts = timescale
+        self.state = 'idle'
+        self.reason = None
+        self.stuck_since = None
+        self.rung_idx = -1
+        self.step = 0
+        self.phase = 'step'          # 'step' | 'settle' | 'next'
+        self.verify_started = False
+        self.busy_until = 0.0
+        self.next_ladder_at = 0.0
+        self.ladder_count = 0
+        self.ladder_started_at = None
+        self.healthy_since = now
+        self.history = []
+        self.seen = {}
+        self.mute_polls = 0
+        self.last_snap = None
+        self.last_nag = 0.0
+        self.tick_errors = 0
+
+    # ---- persistence ----
+
+    def save(self, now):
+        data = {
+            'boot_id': self.sysx.boot_id(), 'saved_at': now,
+            'state': self.state, 'reason': self.reason, 'stuck_since': self.stuck_since,
+            'rung_idx': self.rung_idx, 'step': self.step, 'phase': self.phase,
+            'busy_until': self.busy_until, 'next_ladder_at': self.next_ladder_at,
+            'ladder_count': self.ladder_count, 'ladder_started_at': self.ladder_started_at,
+            'history': self.history[-20:],
+        }
+        self.sysx.write_atomic(STATE_FILE, json.dumps(data))
+
+    def load(self, now):
+        text = self.sysx.read(STATE_FILE)
+        if not text:
+            rlog.info('recovery: state idle (no saved state)')
+            return
+        try:
+            data = json.loads(text)
+        except ValueError:
+            rlog.warning('recovery: saved state unreadable, ignored')
+            return
+        if data.get('boot_id') != self.sysx.boot_id():
+            rlog.info('recovery: saved state from another boot, ignored')
+            return
+        self.state = data.get('state', 'idle')
+        self.reason = data.get('reason')
+        self.stuck_since = data.get('stuck_since')
+        self.rung_idx = data.get('rung_idx', -1)
+        self.step = data.get('step', 0)
+        self.phase = data.get('phase', 'settle')
+        self.busy_until = data.get('busy_until', 0.0)
+        self.next_ladder_at = data.get('next_ladder_at', 0.0)
+        self.ladder_count = data.get('ladder_count', 0)
+        self.ladder_started_at = data.get('ladder_started_at')
+        self.history = data.get('history', [])
+        if self.state == 'rung' and (self.reason not in LADDERS
+                                     or self.rung_idx >= len(LADDERS[self.reason])):
+            self.state = 'idle'
+            self.reason = None
+        if self.state == 'idle':
+            self.healthy_since = now
+        rlog.info('recovery: state %s (loaded, ladder_count %d, reason %s, busy for %s)',
+                  self.state, self.ladder_count, self.reason,
+                  fmt_duration(self.busy_until - now))
+
+    # ---- observation ----
+
+    def _reason_of(self, snap):
+        if not snap.get('connect_wanted', True):
+            return None
+        if self.mute_polls >= AT_MUTE_POLLS:
+            return 'at_mute'
+        if not snap.get('at_alive'):
+            return None
+        sim = snap.get('sim')
+        if sim in SIM_LADDER:
+            return 'sim'
+        if sim != SIM_READY:
+            return None
+        reg = snap.get('reg')
+        if reg is None:
+            return None
+        if reg not in REGISTERED:
+            return 'reg'
+        if reg == REG_ROAMING and not snap.get('roaming_allowed', True):
+            return None
+        if snap.get('dial_failures', 0) >= DIAL_FAILURES_MAX:
+            return 'dial'
+        if snap.get('probe_exhausted'):
+            return 'traffic'
+        return None
+
+    def _grace(self, snap):
+        if self.reason == 'reg' and snap.get('reg') == REG_SEARCHING:
+            return GRACE['reg_searching'] * self.ts
+        return GRACE.get(self.reason, 0) * self.ts
+
+    def _cleared(self, snap):
+        r = self.reason
+        if snap is None:
+            return False
+        if r == 'at_mute':
+            return bool(snap.get('at_alive'))
+        if r == 'sim':
+            return snap.get('sim') in (SIM_READY, SIM_PIN)
+        if r == 'reg':
+            return snap.get('reg') in REGISTERED
+        if r == 'dial':
+            return bool(snap.get('ncm'))
+        if r == 'traffic':
+            return self.actions.traffic_ok()
+        return True
+
+    def observe(self, snap, now):
+        """Feed the poll snapshot. Detectors stand still during a settle window."""
+        self.last_snap = snap
+        if now < self.busy_until:
+            return
+        self.mute_polls = 0 if snap.get('at_alive') else self.mute_polls + 1
+        r = self._reason_of(snap)
+        if r is None:
+            self.seen.clear()
+        else:
+            self.seen.setdefault(r, now)
+            for k in list(self.seen):
+                if k != r:
+                    del self.seen[k]
+        if self.state == 'rung':
+            return
+        if r == self.reason:
+            return
+        if r is None:
+            rlog.info('recovery: [%s] cleared after %s', self.reason,
+                      fmt_duration(now - (self.stuck_since or now)))
+            self._to_idle(now)
+            return
+        old = self.reason
+        self.reason = r
+        self.stuck_since = self.seen[r]
+        self.state = 'grace'
+        rlog.warning('recovery: [%s] stuck (%s)%s, grace %s', r, self._detail(snap),
+                     '' if old is None else ' (was %s)' % old,
+                     fmt_duration(self._grace(snap)))
+        self.actions.on_stuck(r, snap)
+
+    def _detail(self, snap):
+        if snap is None:
+            return '?'
+        r = self.reason
+        if r == 'at_mute':
+            return 'no AT answer for %d polls' % self.mute_polls
+        if r == 'sim':
+            return 'SIM %s' % SIM_NAMES.get(snap.get('sim'), snap.get('sim'))
+        if r == 'reg':
+            return 'CREG %s %s' % (snap.get('reg'), REG_NAMES.get(snap.get('reg'), ''))
+        if r == 'dial':
+            return '%d consecutive dial failures' % snap.get('dial_failures', 0)
+        if r == 'traffic':
+            return 'session up but no traffic'
+        return r
+
+    # ---- tick ----
+
+    def tick(self, now):
+        try:
+            self._tick(now)
+            self.tick_errors = 0
+        except Exception:
+            self.tick_errors += 1
+            rlog.exception('recovery: tick failed (%d/%d)', self.tick_errors, TICK_ERRORS_MAX)
+            if self.tick_errors >= TICK_ERRORS_MAX:
+                rlog.critical('recovery: too many failures, resetting to idle')
+                self.tick_errors = 0
+                self.busy_until = 0.0
+                self._to_idle(now)
+
+    def _tick(self, now):
+        if self.last_snap is None:
+            return
+        if self.state == 'idle':
+            if self.ladder_count and self.healthy_since is not None \
+                    and now - self.healthy_since >= HEALTHY_RESET_AFTER * self.ts:
+                rlog.info('recovery: healthy for %s, ladder counter cleared',
+                          fmt_duration(now - self.healthy_since))
+                self.ladder_count = 0
+                self.next_ladder_at = 0.0
+                self.save(now)
+            return
+        if self.state == 'grace':
+            if now - self.stuck_since < self._grace(self.last_snap):
+                return
+            if now >= self.next_ladder_at:
+                self._start_ladder(now)
+            else:
+                self.state = 'wait'
+                rlog.warning('recovery: [%s] grace over, next ladder allowed in %s (ladder #%d)',
+                             self.reason, fmt_duration(self.next_ladder_at - now),
+                             self.ladder_count + 1)
+            return
+        if self.state == 'wait':
+            if now >= self.next_ladder_at:
+                self._start_ladder(now)
+            elif now - self.last_nag >= NAG_INTERVAL * self.ts:
+                self.last_nag = now
+                rlog.warning('recovery: [%s] still stuck (%s), next ladder in %s (ladder #%d)',
+                             self.reason, self._detail(self.last_snap),
+                             fmt_duration(self.next_ladder_at - now), self.ladder_count + 1)
+            return
+        if self.state == 'rung':
+            if now < self.busy_until:
+                return
+            if self.phase == 'step':
+                self._run_step(now)
+            elif self.phase == 'next':
+                self._advance_rung(now)
+            else:  # settle over: verify, then judge
+                if self.reason == 'dial' and not self.verify_started:
+                    if self.actions.verify_dial(now):
+                        self.verify_started = True
+                        self.busy_until = now + VERIFY_WINDOW
+                        return
+                if self._cleared(self.last_snap):
+                    self._finish_ladder(now, True)
+                else:
+                    self._advance_rung(now)
+
+    # ---- ladder mechanics ----
+
+    def _ladder(self):
+        return LADDERS.get(self.reason, [])
+
+    def _destructive_recent(self, now):
+        return sum(1 for h in self.history
+                   if h.get('rung') in RUNG_DESTRUCTIVE and h.get('result') == 'sent'
+                   and now - h.get('t', 0) < DESTRUCTIVE_WINDOW)
+
+    def _start_ladder(self, now):
+        self.state = 'rung'
+        self.rung_idx = -1
+        self.ladder_started_at = now
+        rlog.warning('recovery: [%s] ladder #%d starting (%s, stuck for %s, level %d)',
+                     self.reason, self.ladder_count + 1, self._detail(self.last_snap),
+                     fmt_duration(now - (self.stuck_since or now)), self.level)
+        self._advance_rung(now)
+
+    def _advance_rung(self, now):
+        ladder = self._ladder()
+        idx = self.rung_idx + 1
+        while idx < len(ladder):
+            rung = ladder[idx]
+            if RUNG_MIN_LEVEL[rung] > self.level:
+                rlog.info('recovery: [%s] rung %d/%d %s skipped (RECOVERY_LEVEL=%d)',
+                          self.reason, idx + 1, len(ladder), rung, self.level)
+                idx += 1
+                continue
+            if rung in RUNG_DESTRUCTIVE and self._destructive_recent(now) >= DESTRUCTIVE_MAX:
+                rlog.error('recovery: [%s] rung %d/%d %s refused: %d destructive resets '
+                           'in the last %s', self.reason, idx + 1, len(ladder), rung,
+                           DESTRUCTIVE_MAX, fmt_duration(DESTRUCTIVE_WINDOW))
+                idx += 1
+                continue
+            break
+        if idx >= len(ladder):
+            self._finish_ladder(now, False)
+            return
+        self.rung_idx = idx
+        self.step = 0
+        self.phase = 'step'
+        self.verify_started = False
+        self._run_step(now)
+
+    def _run_step(self, now):
+        ladder = self._ladder()
+        rung = ladder[self.rung_idx]
+        nsteps = RUNG_STEPS[rung]
+        destructive = rung in RUNG_DESTRUCTIVE
+        if destructive:
+            # The service may not survive this command: persist first, so that
+            # the next instance waits out the settle time instead of acting.
+            self.step = nsteps
+            self.phase = 'settle'
+            self.busy_until = now + SETTLE[rung] * self.ts
+            self.history.append({'t': now, 'reason': self.reason, 'rung': rung, 'result': 'sent'})
+            self.save(now)
+        result = self.actions.run_rung_step(rung, self.step if not destructive else 0, now)
+        rlog.warning('recovery: [%s] ladder #%d rung %d/%d %s step %d -> %s',
+                     self.reason, self.ladder_count + 1, self.rung_idx + 1, len(ladder),
+                     rung, (self.step if not destructive else 0) + 1, result)
+        if result == 'sent':
+            if destructive:
+                return
+            self.step += 1
+            if self.step < nsteps:
+                self.phase = 'step'
+                self.busy_until = now + STEP_GAP
+            else:
+                self.phase = 'settle'
+                self.busy_until = now + SETTLE[rung] * self.ts
+                self.history.append({'t': now, 'reason': self.reason, 'rung': rung, 'result': 'sent'})
+            return
+        # refused / impossible: next rung at the next poll
+        if destructive:
+            self.history[-1]['result'] = result
+        else:
+            self.history.append({'t': now, 'reason': self.reason, 'rung': rung, 'result': result})
+        self.phase = 'next'
+        self.busy_until = now + STEP_GAP
+        if destructive:
+            self.save(now)
+
+    def _finish_ladder(self, now, success):
+        ladder = self._ladder()
+        rung = ladder[self.rung_idx] if 0 <= self.rung_idx < len(ladder) else '-'
+        elapsed = fmt_duration(now - (self.stuck_since or now))
+        if success:
+            rlog.warning('recovery: [%s] recovered at rung %d/%d %s after %s',
+                         self.reason, self.rung_idx + 1, len(ladder), rung, elapsed)
+            self.history.append({'t': now, 'reason': self.reason, 'rung': rung, 'result': 'recovered'})
+            reason = self.reason
+            self._to_idle(now)
+            self.actions.on_recovered(reason)
+            return
+        if self.reason == 'traffic':
+            rlog.error('recovery: [traffic] the radio cycle did not restore traffic after %s, '
+                       'suspending the probe for %s', elapsed, fmt_duration(PROBE_SUSPEND * self.ts))
+            self._to_idle(now)
+            self.actions.on_traffic_exhausted(now)
+            return
+        self.ladder_count += 1
+        backoff = min(LADDER_BACKOFF_MIN * (2 ** (self.ladder_count - 1)), LADDER_BACKOFF_MAX) * self.ts
+        self.next_ladder_at = now + backoff
+        self.state = 'wait'
+        self.last_nag = now
+        rlog.error('recovery: [%s] ladder #%d exhausted after %d rungs (%s), next ladder in %s',
+                   self.reason, self.ladder_count, self.rung_idx + 1,
+                   fmt_duration(now - (self.ladder_started_at or now)), fmt_duration(backoff))
+        self.save(now)
+
+    def _to_idle(self, now):
+        self.state = 'idle'
+        self.reason = None
+        self.stuck_since = None
+        self.rung_idx = -1
+        self.step = 0
+        self.phase = 'step'
+        self.verify_started = False
+        self.healthy_since = now
+        self.seen.clear()
+        self.save(now)
+
+    def cancel(self, now, why):
+        if self.state != 'idle':
+            rlog.warning('recovery: [%s] cancelled (%s)', self.reason, why)
+            self._to_idle(now)
+
+    def allows_session_watchdog(self, now):
+        return self.state in ('idle', 'grace', 'wait') and now >= self.busy_until
+
+    def current_rung(self):
+        ladder = self._ladder()
+        if self.state == 'rung' and 0 <= self.rung_idx < len(ladder):
+            return ladder[self.rung_idx]
+        return ''
+
+    def describe(self, now):
+        return {
+            '/Recovery/State': self.state,
+            '/Recovery/Reason': self.reason or '',
+            '/Recovery/Rung': self.current_rung(),
+            '/Recovery/LadderCount': self.ladder_count,
+            '/Recovery/NextLadderIn': int(max(0, self.next_ladder_at - now)) if self.state == 'wait' else 0,
+        }
+
+
 class ModemService:
-    def __init__(self, dev):
-        self.modem = E3372Modem(dev)
+    def __init__(self, dev, cfg=None, sysx=None, wdm=None):
+        self.cfg = cfg or Config()
+        self.sysx = sysx or SystemShim()
+        self.stop_event = threading.Event()
+        self.modem = E3372Modem(dev, self.sysx, self.stop_event)
+        self.wdm = wdm or WdmChannel(WDM_DEV, self.sysx)
         self.dbus = None
         self.settings = None
         self.ncm_connected = False
-        self.sim_present = True
+        self.sim_status = None
+        self.reg_status = None
         self.identified = False
-        # watchdog state
+        self.at_alive = False
+        self.resync_needed = False
+        # session watchdog state
         self.redial_count = 0
         self.next_redial = 0.0
+        self.dial_deadline = None
+        self.dial_started_at = None
+        self.dial_failures = 0
+        self.session_up_at = None
+        self.no_ip_since = None
+        self.last_dhcp_restart = 0.0
+        # probe state
         self.probe_failures = 0
         self.probe_redials = 0
-        self.probe_disabled = False
+        self.probe_exhausted = False
+        self.probe_suspended_until = 0.0
         self.last_probe = 0.0
         self.probe_thread = None
+        # SIM PIN
+        self.pin_attempted = False
+        # logging
+        self.signal = {}
+        self.last_signal_log = 0.0
+        self.nags = {}
+        # recovery ladder
+        self.recovery = Recovery(self, self.sysx, self.cfg.recovery_level,
+                                 self.cfg.timescale, time.monotonic())
+
+    # ---- lifecycle -----------------------------------------------------------
 
     def start(self):
         dbus.mainloop.glib.threads_init()
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 
         self.dbus = VeDbusService('com.victronenergy.modem', register=False)
-        self.dbus.add_path('/Model', None)
-        self.dbus.add_path('/IMEI', None)
-        self.dbus.add_path('/NetworkName', None)
-        self.dbus.add_path('/NetworkType', None)
-        self.dbus.add_path('/SignalStrength', None)
-        self.dbus.add_path('/Roaming', None)
-        self.dbus.add_path('/Connected', 0)
-        self.dbus.add_path('/IP', None)
-        self.dbus.add_path('/SimStatus', None)
-        self.dbus.add_path('/RegStatus', None)
-        self.dbus.add_path('/PPPStatus', 0)
-        self.dbus.register()
+        for path, value in (('/Model', None), ('/IMEI', None), ('/NetworkName', None),
+                            ('/NetworkType', None), ('/SignalStrength', None), ('/Roaming', None),
+                            ('/Connected', 0), ('/IP', None), ('/SimStatus', None),
+                            ('/RegStatus', None), ('/PPPStatus', 0),
+                            ('/Recovery/State', 'idle'), ('/Recovery/Reason', ''),
+                            ('/Recovery/Rung', ''), ('/Recovery/LadderCount', 0),
+                            ('/Recovery/NextLadderIn', 0),
+                            ('/Signal/Rsrp', None), ('/Signal/Sinr', None), ('/Signal/Rsrq', None)):
+            self.dbus.add_path(path, value)
 
+        # The previous instance may still hold the name for a moment after a
+        # restart: retry instead of dying and leaving serial-starter to loop.
+        deadline = time.monotonic() + REGISTER_RETRY_FOR
+        while True:
+            try:
+                self.dbus.register()
+                break
+            except Exception as e:
+                if time.monotonic() >= deadline or self.stop_event.is_set():
+                    log.error('D-Bus registration failed: %s', e)
+                    return False
+                log.warning('D-Bus name busy (%s), retrying', e)
+                time.sleep(2)
         log.info('Registered on D-Bus as com.victronenergy.modem')
 
         self.settings = SettingsDevice(self.dbus.dbusconn, modem_settings,
                                        self.setting_changed, timeout=10)
 
-        if not self.modem.open():
-            log.error('Failed to open modem, exiting')
-            return False
+        self.recovery.load(time.monotonic())
 
-        # Initial modem setup
+        if not self.modem.open():
+            # Keep running: the port is reopened at every poll and the recovery
+            # ladder can act on a dead modem.
+            log.error('Failed to open modem, will keep trying')
+
         self._init_modem()
 
         GLib.timeout_add(POLL_INTERVAL * 1000, self._update)
-
         return True
+
+    def stop(self):
+        self.stop_event.set()
 
     def setting_changed(self, setting, old, new):
         log.info('Setting %s changed: %s -> %s', setting, old, new)
+        now = time.monotonic()
         if setting == 'apn':
             self._hangup()
             if self._connect_wanted():
                 self._reset_backoff()
-                self._dial()
+                self._dial_start(now)
         elif setting == 'connect':
             if new:
                 self._reset_backoff()
-                self._dial()
+                self._dial_start(now)
             else:
                 self._hangup()
+                self.recovery.cancel(now, '/Settings/Modem/Connect switched off')
+        elif setting == 'pin':
+            self.pin_attempted = False
+
+    # ---- identification ------------------------------------------------------
 
     def _identify(self):
         """Modem identification (/Model, /IMEI). Retried from _update until it
         succeeds: a single AT timeout at startup must not leave both empty
         forever."""
-        r = self.modem.at('AT')
-        if r is None:
+        if self.modem.at('AT') is None:
             return False
+        self.modem.at('AT+CMEE=1')     # numeric error codes
+        self.modem.at('AT^CURC=0')     # no unsolicited ^RSSI/^HCSQ/^MODE reports
 
-        # Model
         r = self.modem.at('AT+CGMM')
         if r:
-            self.dbus['/Model'] = r[0]
-            log.info('Model: %s', r[0])
+            for line in r:
+                if not line.startswith('+') and not line.startswith('^'):
+                    self.dbus['/Model'] = line
+                    log.info('Model: %s', line)
+                    break
 
-        # IMEI
         r = self.modem.at('AT+CGSN')
         if r:
-            self.dbus['/IMEI'] = r[0]
-            log.info('IMEI: %s', r[0])
-
-        # Enable numeric error codes
-        self.modem.at('AT+CMEE=1')
+            for line in r:
+                if not line.startswith('+') and not line.startswith('^'):
+                    self.dbus['/IMEI'] = line
+                    log.info('IMEI: %s', line)
+                    break
 
         self.identified = (self.dbus['/Model'] is not None
                            and self.dbus['/IMEI'] is not None)
@@ -252,28 +1049,41 @@ class ModemService:
 
     def _init_modem(self):
         """Initial modem identification and NCM setup."""
+        now = time.monotonic()
         if not self._identify():
             log.error('Modem not responding, will retry')
             return
 
-        self._query_ncm()
-        if not self.ncm_connected and self._connect_wanted():
-            self._dial()
-
-        # First update
         self._update_status()
+        if self.ncm_connected:
+            # A restart of the service must not cost the data session (and the
+            # remote access that rides on it).
+            rlog.info('session: already up, keeping it')
+            self.session_up_at = now
+            self._ensure_dhcp()
+        elif self._connect_wanted() and self.sim_status == SIM_READY \
+                and (self.reg_status == REG_HOME
+                     or (self.reg_status == REG_ROAMING and self._roaming_allowed())):
+            self._dial_start(now)
+        # Otherwise the session watchdog dials as soon as the modem is
+        # registered, and the recovery ladder handles the rest.
 
-    # ---- NCM session ------------------------------------------------------
+    # ---- NCM session ---------------------------------------------------------
 
     def _apn(self):
         apn = self.settings['apn'] if self.settings else ''
-        return apn or APN
+        return apn or self.cfg.apn
 
     def _connect_wanted(self):
         """True unless the user turned the connection off in the UI."""
         if self.settings is None:
             return True
         return bool(self.settings['connect'])
+
+    def _roaming_allowed(self):
+        if self.settings is None:
+            return True
+        return bool(self.settings['roaming'])
 
     def _query_ncm(self):
         """Refresh self.ncm_connected from the modem. Keeps the previous value
@@ -288,170 +1098,325 @@ class ModemService:
                     break
         return self.ncm_connected
 
-    def _dial(self):
-        """Bring the NCM data session up. Returns True on success."""
+    def _dial_start(self, now):
+        """First phase of a dial (a few seconds): hang up, make sure the old
+        session is really down, request a new one. The outcome is observed by
+        _poll_dial at the next polls."""
+        if self.dial_deadline is not None:
+            return False
         apn = self._apn()
-        log.info('NCM dial: APN=%s', apn)
+        rlog.info('session: dial APN=%s', apn)
         self.dbus['/PPPStatus'] = PPP_INIT
 
         self.modem.at('AT+CGDCONT=1,"IP","%s"' % apn)
-        time.sleep(0.5)
         # Always hang up first: NDISDUP on an already-half-open context is
-        # silently ignored by the E3372h firmware.
+        # silently ignored by the E3372h firmware, and a new session requested
+        # while the old one is still being torn down dies with it.
         self.modem.at('AT^NDISDUP=1,0', timeout=5)
-        self.ncm_connected = False
-        time.sleep(1)
-        self.modem.at('AT^NDISDUP=1,1,"%s"' % apn, timeout=10)
-
-        for _ in range(10):
-            time.sleep(1)
-            if self._query_ncm():
+        self.ncm_connected = True
+        for _ in range(6):
+            if not self._query_ncm() or not self.modem.responded():
                 break
-
-        if not self.ncm_connected:
-            log.warning('NCM dial failed, session still down')
-            self.dbus['/PPPStatus'] = PPP_DOWN
-            return False
-
-        log.info('NCM session up, (re)starting DHCP on %s', IFACE)
-        self._restart_dhcp()
+            time.sleep(0.5)
+        self.ncm_connected = False
+        self.session_up_at = None
+        self.modem.at('AT^NDISDUP=1,1,"%s"' % apn, timeout=10)
+        self.dial_started_at = now
+        self.dial_deadline = now + DIAL_TIMEOUT
         return True
 
+    def _poll_dial(self, now):
+        """Second phase of a dial: judge it on the session state refreshed by
+        _update_status."""
+        if self.dial_deadline is None:
+            return
+        if self.ncm_connected:
+            rlog.info('session: up %s after dial, (re)starting DHCP on %s',
+                      fmt_duration(now - (self.dial_started_at or now)), IFACE)
+            self.dial_deadline = None
+            self.session_up_at = now
+            self.dial_failures = 0
+            self.no_ip_since = None
+            self._restart_dhcp()
+            self.dbus['/PPPStatus'] = PPP_UP
+        elif now >= self.dial_deadline:
+            self.dial_deadline = None
+            self.dial_failures += 1
+            rlog.warning('session: dial failed, session still down (%d consecutive)',
+                         self.dial_failures)
+            self.dbus['/PPPStatus'] = PPP_DOWN
+
+    def _cancel_dial(self):
+        self.dial_deadline = None
+
     def _hangup(self):
-        log.info('NCM hangup')
+        rlog.info('session: hangup')
+        self._cancel_dial()
         self.modem.at('AT^NDISDUP=1,0', timeout=5)
         self.ncm_connected = False
+        self.session_up_at = None
         self.dbus['/PPPStatus'] = PPP_DOWN
         self._stop_dhcp()
 
-    # ---- DHCP client ------------------------------------------------------
+    # ---- DHCP client ---------------------------------------------------------
 
     def _dhcp_pid(self):
         """PID of the udhcpc instance owning IFACE, or None."""
         try:
-            with open(DHCP_PIDFILE) as f:
-                pid = int(f.read().strip())
-            with open('/proc/%d/cmdline' % pid, 'rb') as f:
-                if b'udhcpc' in f.read():
-                    return pid
-        except Exception:
-            pass
+            pid = int((self.sysx.read(DHCP_PIDFILE) or '').strip())
+        except ValueError:
+            return None
+        if b'udhcpc' in self.sysx.pid_cmdline(pid):
+            return pid
         return None
 
     def _ensure_dhcp(self):
         if self._dhcp_pid():
             return
         log.info('starting udhcpc on %s', IFACE)
-        # No -q: udhcpc stays resident and renews the lease. The previous
-        # version quit as soon as it had an address, so nothing ever renewed
-        # it and nothing ever restored the default route.
-        os.system('udhcpc -i %s -b -p %s -t 8 -T 3 -A 15 >/dev/null 2>&1 &'
-                  % (IFACE, DHCP_PIDFILE))
+        # No -q: udhcpc stays resident and renews the lease.
+        self.sysx.sh('udhcpc -i %s -b -p %s -t 8 -T 3 -A 15 >/dev/null 2>&1 &'
+                     % (IFACE, DHCP_PIDFILE))
 
     def _stop_dhcp(self):
         pid = self._dhcp_pid()
         if pid:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except Exception:
-                pass
-        try:
-            os.remove(DHCP_PIDFILE)
-        except Exception:
-            pass
+            self.sysx.kill(pid)
+        self.sysx.remove(DHCP_PIDFILE)
 
     def _restart_dhcp(self):
         self._stop_dhcp()
         time.sleep(0.5)
-        os.system('ip link set %s up 2>/dev/null' % IFACE)
+        self.sysx.sh('ip link set %s up 2>/dev/null' % IFACE)
         # The old address and its default route survive a dropped session and
         # would otherwise black-hole every packet.
-        os.system('ip -4 addr flush dev %s 2>/dev/null' % IFACE)
+        self.sysx.sh('ip -4 addr flush dev %s 2>/dev/null' % IFACE)
         self._ensure_dhcp()
 
     def _iface_ip(self):
-        try:
-            result = subprocess.run(['ip', '-4', 'addr', 'show', IFACE],
-                                    capture_output=True, text=True, timeout=5)
-            for line in result.stdout.split('\n'):
-                if 'inet ' in line:
-                    return line.strip().split()[1].split('/')[0]
-        except Exception:
-            pass
+        result = self.sysx.run(['ip', '-4', 'addr', 'show', IFACE], timeout=5)
+        if result is None:
+            return ''
+        for line in result.stdout.split('\n'):
+            if 'inet ' in line:
+                return line.strip().split()[1].split('/')[0]
         return ''
 
-    # ---- status -----------------------------------------------------------
+    # ---- status --------------------------------------------------------------
+
+    def _nag(self, key, level, msg, now):
+        if now - self.nags.get(key, -NAG_INTERVAL) < NAG_INTERVAL:
+            return
+        self.nags[key] = now
+        rlog.log(level, msg)
+
+    def _set_sim(self, sim, now):
+        if sim == self.sim_status:
+            return False
+        rlog.warning('sim: %s -> %s', self._sim_name(self.sim_status), self._sim_name(sim))
+        self.sim_status = sim
+        self.dbus['/SimStatus'] = sim
+        if sim == SIM_READY:
+            self.pin_attempted = False
+        return True
+
+    @staticmethod
+    def _sim_name(sim):
+        if sim is None:
+            return 'unknown'
+        return '%s (%s)' % (sim, SIM_NAMES.get(sim, 'code %s' % sim))
+
+    @staticmethod
+    def _reg_name(reg):
+        if reg is None:
+            return 'unknown'
+        return '%s (%s)' % (reg, REG_NAMES.get(reg, '?'))
+
+    def _set_reg(self, reg):
+        if reg == self.reg_status:
+            return False
+        rlog.warning('reg: %s -> %s', self._reg_name(self.reg_status), self._reg_name(reg))
+        self.reg_status = reg
+        self.dbus['/RegStatus'] = reg
+        self.dbus['/Roaming'] = (reg == REG_ROAMING)
+        return True
+
+    def _publish_no_network(self):
+        self.ncm_connected = False
+        self.dbus['/SignalStrength'] = 0
+        self.dbus['/NetworkName'] = ''
+        self.dbus['/NetworkType'] = ''
+        self.dbus['/Connected'] = 0
+        self.dbus['/PPPStatus'] = PPP_DOWN
+        self.dbus['/IP'] = ''
+
+    def _handle_pin(self, now):
+        pin = (self.settings['pin'] if self.settings else '') or ''
+        if not pin:
+            self._nag('pin', logging.ERROR,
+                      'sim: PIN required but /Settings/Modem/PIN is empty', now)
+            return
+        if self.pin_attempted:
+            return
+        self.pin_attempted = True
+        rlog.info('sim: PIN required, sending it')
+        if self.modem.at('AT+CPIN="%s"' % pin, timeout=10) is not None:
+            rlog.info('sim: PIN accepted')
+            return
+        err = self.modem.last_error
+        if err == SIM_BAD_PASSWD or err == 'error':
+            # One wrong attempt is one too many: three lock the SIM (PUK).
+            rlog.error('sim: wrong PIN, clearing /Settings/Modem/PIN')
+            self.settings['pin'] = ''
+            self._set_sim(SIM_BAD_PASSWD, now)
+        else:
+            rlog.error('sim: PIN entry failed (%s)', err)
 
     def _update_status(self):
-        """Query modem status and update D-Bus values."""
+        """Query modem status and update D-Bus values. Stops at the first
+        timeout: a mute modem must not cost one timeout per command."""
+        now = time.monotonic()
+        changed = False
+
+        if self.resync_needed:
+            self.modem.at('AT', timeout=1)
+            self.resync_needed = False
+
         # SIM status
         r = self.modem.at('AT+CPIN?')
-        if r:
-            self.sim_present = True
+        if r is None:
+            if not self.modem.responded():
+                self.at_alive = False
+                return
+            err = self.modem.last_error
+            sim = err if err in CME_SIM_CODES else SIM_ERROR
+        else:
+            text = ''
             for line in r:
                 if '+CPIN:' in line:
-                    status = line.split(':')[1].strip()
-                    self.dbus['/SimStatus'] = 1000 if status == 'READY' else 1001
-        else:
-            # AT+CPIN? returned error (CME ERROR: 10 = no SIM inserted)
-            self.sim_present = False
-            self.ncm_connected = False
-            self.dbus['/SimStatus'] = 0
-            self.dbus['/SignalStrength'] = 0
-            self.dbus['/NetworkName'] = ''
-            self.dbus['/NetworkType'] = ''
-            self.dbus['/RegStatus'] = 0
-            self.dbus['/Connected'] = 0
-            self.dbus['/PPPStatus'] = PPP_DOWN
-            self.dbus['/IP'] = ''
-            self.dbus['/Roaming'] = False
+                    text = line.split(':', 1)[1].strip()
+            sim = CPIN_TEXT.get(text, SIM_ERROR)
+        self.at_alive = True
+        if sim == SIM_PIN and self.sim_status == SIM_BAD_PASSWD \
+                and not ((self.settings['pin'] if self.settings else '') or ''):
+            # Keep "wrong PIN" on display until a new PIN is entered: the
+            # modem itself only ever says "PIN required".
+            sim = SIM_BAD_PASSWD
+        changed |= self._set_sim(sim, now)
+
+        if sim == SIM_PIN:
+            self._handle_pin(now)
+        elif sim in SIM_HUMAN:
+            self._nag('sim-human', logging.ERROR,
+                      'sim: %s, human intervention needed' % self._sim_name(sim), now)
+
+        if sim != SIM_READY:
+            changed |= self._set_reg(None)
+            self._publish_no_network()
+            self.signal = {}
             return
 
         # Signal strength
         r = self.modem.at('AT+CSQ')
+        if not self.modem.responded():
+            return
+        csq = None
         if r:
             for line in r:
                 if '+CSQ:' in line:
-                    parts = line.split(':')[1].strip().split(',')
-                    csq = int(parts[0])
-                    self.dbus['/SignalStrength'] = csq
+                    try:
+                        csq = int(line.split(':')[1].strip().split(',')[0])
+                        self.dbus['/SignalStrength'] = csq
+                    except ValueError:
+                        pass
 
         # Registration status
         r = self.modem.at('AT+CREG?')
+        if not self.modem.responded():
+            return
         if r:
             for line in r:
                 if '+CREG:' in line:
                     parts = line.split(':')[1].strip().split(',')
-                    stat = int(parts[1]) if len(parts) > 1 else int(parts[0])
-                    self.dbus['/RegStatus'] = stat
-                    self.dbus['/Roaming'] = (stat == REG_ROAMING)
+                    try:
+                        stat = int(parts[1]) if len(parts) > 1 else int(parts[0])
+                        changed |= self._set_reg(stat)
+                    except ValueError:
+                        pass
 
         # Operator
         r = self.modem.at('AT+COPS?')
+        if not self.modem.responded():
+            return
         if r:
             for line in r:
                 if '+COPS:' in line:
                     parts = line.split(',')
                     if len(parts) >= 3:
-                        name = parts[2].strip('" ')
-                        self.dbus['/NetworkName'] = name
-                        # Access technology
+                        self.dbus['/NetworkName'] = parts[2].strip('" ')
                         if len(parts) >= 4:
-                            act = int(parts[3])
-                            tech_map = {0: 'GSM', 2: 'UMTS', 7: 'LTE'}
-                            self.dbus['/NetworkType'] = tech_map.get(act, 'Unknown')
+                            try:
+                                self.dbus['/NetworkType'] = ACT_NAMES.get(int(parts[3]), 'Unknown')
+                            except ValueError:
+                                self.dbus['/NetworkType'] = 'Unknown'
+                    else:
+                        self.dbus['/NetworkName'] = ''
+                        self.dbus['/NetworkType'] = ''
 
-        # NCM connection status - this is the only source of truth for the
-        # data session. An address left over on wwan0 proves nothing: it
-        # survives a dropped session and used to be reported as "connected",
-        # which is exactly what hid this failure from the UI.
+        # NCM connection status - the only source of truth for the data
+        # session. An address left over on wwan0 proves nothing.
+        was = self.ncm_connected
         self._query_ncm()
+        if not self.modem.responded():
+            return
+        changed |= (was != self.ncm_connected)
 
         self.dbus['/IP'] = self._iface_ip()
         self.dbus['/Connected'] = 1 if self.ncm_connected else 0
-        self.dbus['/PPPStatus'] = PPP_UP if self.ncm_connected else PPP_DOWN
+        if self.ncm_connected:
+            self.dbus['/PPPStatus'] = PPP_UP
+        else:
+            self.dbus['/PPPStatus'] = PPP_INIT if self.dial_deadline is not None else PPP_DOWN
 
-    # ---- watchdog ---------------------------------------------------------
+        if changed or now - self.last_signal_log >= SIGNAL_LOG_INTERVAL:
+            self._log_signal(now, csq)
+
+    def _log_signal(self, now, csq=None):
+        self.last_signal_log = now
+        r = self.modem.at('AT^HCSQ?')
+        if r:
+            for line in r:
+                if line.startswith('^HCSQ:'):
+                    self.signal = hcsq_to_dbm(line)
+                    break
+        self.dbus['/Signal/Rsrp'] = self.signal.get('rsrp')
+        self.dbus['/Signal/Sinr'] = self.signal.get('sinr')
+        self.dbus['/Signal/Rsrq'] = self.signal.get('rsrq')
+        if csq is None:
+            csq = self.dbus['/SignalStrength']
+        log.info(fmt_signal(self.signal, csq))
+
+    def _log_diag(self):
+        """Best-effort diagnostic when a stuck condition is detected."""
+        for cmd in ('AT^SYSINFOEX', 'AT+CEER'):
+            r = self.modem.at(cmd)
+            if r:
+                rlog.info('diag: %s -> %s', cmd, ' | '.join(r))
+
+    def _snapshot(self):
+        return {
+            'at_alive': self.at_alive,
+            'sim': self.sim_status,
+            'reg': self.reg_status,
+            'ncm': self.ncm_connected,
+            'ip': self.dbus['/IP'] or '',
+            'dial_failures': self.dial_failures,
+            'probe_exhausted': self.probe_exhausted,
+            'connect_wanted': self._connect_wanted(),
+            'roaming_allowed': self._roaming_allowed(),
+        }
+
+    # ---- session watchdog ----------------------------------------------------
 
     def _reset_backoff(self):
         self.redial_count = 0
@@ -461,26 +1426,23 @@ class ModemService:
     def _probe(self):
         """Verify traffic actually flows. Runs in a worker thread."""
         ok = False
-        try:
-            result = subprocess.run(
-                ['ping', '-c', '2', '-W', '3', '-I', IFACE, PROBE_HOST],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-            ok = (result.returncode == 0)
-        except Exception:
-            ok = False
-
+        for host in self.cfg.probe_hosts:
+            if self.sysx.ping(host, IFACE):
+                ok = True
+                break
         if ok:
             if self.probe_failures:
                 log.info('connectivity probe recovered')
             self.probe_failures = 0
             self.probe_redials = 0
+            self.probe_exhausted = False
         else:
             self.probe_failures += 1
             log.warning('connectivity probe failed (%d/%d)',
                         self.probe_failures, PROBE_FAILURES_MAX)
 
     def _maybe_probe(self, now):
-        if not PROBE_HOST or self.probe_disabled:
+        if not self.cfg.probe_hosts or now < self.probe_suspended_until:
             return
         if self.probe_thread is not None and self.probe_thread.is_alive():
             return
@@ -491,7 +1453,7 @@ class ModemService:
         self.probe_thread.start()
 
     def _maybe_redial(self, reason, now):
-        if now < self.next_redial:
+        if self.dial_deadline is not None or now < self.next_redial:
             return
         self.redial_count += 1
         backoff = min(REDIAL_MIN_BACKOFF * (2 ** (self.redial_count - 1)),
@@ -499,15 +1461,25 @@ class ModemService:
         self.next_redial = now + backoff
         log.warning('watchdog: %s - re-dialling (attempt %d, next retry in %ds)',
                     reason, self.redial_count, backoff)
-        if self._dial():
-            log.info('watchdog: data session re-established')
-            self._reset_backoff()
+        self._dial_start(now)
 
-    def _watchdog(self):
-        """Keep the data session alive. Called after every status poll."""
-        now = time.monotonic()
+    def _track_session(self, now):
+        """Session up/down bookkeeping, independent of any watchdog."""
+        if self.ncm_connected:
+            if self.session_up_at is None:
+                self.session_up_at = now
+                if self.dial_deadline is None:
+                    rlog.info('session: up (not dialled by us), ensuring DHCP')
+                    self._ensure_dhcp()
+        elif self.session_up_at is not None:
+            rlog.warning('session: down after %s', fmt_duration(now - self.session_up_at))
+            self.session_up_at = None
+            self.no_ip_since = None
 
-        if not self.sim_present:
+    def _session_watchdog(self, now):
+        """Keep the data session alive while the modem is registered. The
+        recovery ladder handles every other state."""
+        if self.sim_status != SIM_READY:
             return
 
         if not self._connect_wanted():
@@ -516,89 +1488,255 @@ class ModemService:
                 self._hangup()
             return
 
-        reg = self.dbus['/RegStatus']
-        if reg not in (REG_HOME, REG_ROAMING):
-            # Not attached to a network: dialling would fail anyway, and the
-            # backoff must not run away while we are simply out of coverage.
+        reg = self.reg_status
+        if reg not in REGISTERED:
+            # Not attached to a network: dialling would fail anyway. The
+            # recovery ladder is in charge of getting the modem back.
             self.probe_failures = 0
             return
 
-        if reg == REG_ROAMING and self.settings is not None \
-                and not self.settings['roaming']:
+        if reg == REG_ROAMING and not self._roaming_allowed():
+            self._nag('roaming', logging.INFO,
+                      'watchdog: roaming network and roaming not permitted, staying offline', now)
             return
 
         if not self.ncm_connected:
             self._maybe_redial('NCM data session down', now)
             return
 
+        # Session up. The re-dial backoff is only forgiven once the session
+        # has held for a while: a session that dies seconds after each dial
+        # must not be re-dialled every 30 s forever.
+        if self.redial_count and self.session_up_at is not None \
+                and now - self.session_up_at >= SESSION_STABLE:
+            rlog.info('session: stable for %s, re-dial backoff reset',
+                      fmt_duration(now - self.session_up_at))
+            self._reset_backoff()
+
         if not self.dbus['/IP']:
-            self._ensure_dhcp()
+            if self.no_ip_since is None:
+                self.no_ip_since = now
+            if now - self.no_ip_since >= DHCP_STALE \
+                    and now - self.last_dhcp_restart >= DHCP_RESTART_MIN_GAP:
+                rlog.warning('session: no address for %s, restarting DHCP',
+                             fmt_duration(now - self.no_ip_since))
+                self.last_dhcp_restart = now
+                self._restart_dhcp()
+            else:
+                self._ensure_dhcp()
             return
+        self.no_ip_since = None
 
         # Session up with an address: make sure packets really come back.
         self._maybe_probe(now)
         if self.probe_failures < PROBE_FAILURES_MAX:
             return
 
-        # A probe that never recovers is far more likely to be a filtered ping
-        # than a broken session. Stop re-dialling rather than cycling the
-        # connection forever.
         if self.probe_redials >= PROBE_REDIALS_MAX:
-            if not self.probe_disabled:
-                log.error('connectivity probe to %s never recovers after %d '
-                          're-dials, disabling it. If your operator filters '
-                          'ICMP, set PROBE_HOST= (empty) in %s',
-                          PROBE_HOST, self.probe_redials, CONFIG_FILE)
-                self.probe_disabled = True
+            # Re-dialling does not help: hand over to the recovery ladder.
+            self.probe_exhausted = True
             return
 
         before = self.next_redial
-        self._maybe_redial('no connectivity after %d probes'
-                           % self.probe_failures, now)
+        self._maybe_redial('no connectivity after %d probes' % self.probe_failures, now)
         if self.next_redial != before:
             self.probe_redials += 1
 
-    def _update(self):
-        """Periodic update called by GLib."""
+    # ---- recovery actions (called by Recovery) -------------------------------
+
+    def _heavy_at(self, cmd):
+        """Send a slow or disruptive command, preferably on the wdm channel.
+        Returns 'sent', 'refused' or 'impossible'."""
+        if self.wdm.available():
+            status, text = self.wdm.send(cmd, timeout=3)
+            if status in ('ok', 'timeout'):
+                log.info('%s via wdm -> %s', cmd, status)
+                return 'sent'
+            if status == 'error':
+                log.warning('%s via wdm -> %s', cmd, text.strip().replace('\r\n', ' '))
+                return 'refused'
+            # nodev: fall back to the serial port
+        r = self.modem.at(cmd, timeout=3)
+        err = self.modem.last_error
+        if r is not None:
+            log.info('%s via serial -> ok', cmd)
+            return 'sent'
+        if err == 'timeout':
+            log.info('%s via serial -> sent (no answer yet)', cmd)
+            self.resync_needed = True
+            return 'sent'
+        if err in ('io', 'nodev'):
+            return 'impossible'
+        return 'refused'
+
+    def _usb_sysfs_path(self):
+        """sysfs directory of the modem's USB device (the one with idVendor)."""
+        candidates = [
+            '/sys/class/tty/%s/device' % posixpath.basename(self.modem.dev),
+            '/sys/class/net/%s/device' % IFACE,
+        ]
+        for c in candidates:
+            if not self.sysx.exists(c):
+                continue
+            d = self.sysx.realpath(c)
+            for _ in range(6):
+                if self.sysx.exists(posixpath.join(d, 'idVendor')):
+                    if (self.sysx.read(posixpath.join(d, 'idVendor')) or '').strip() == '12d1':
+                        return d
+                    break
+                d = posixpath.dirname(d)
+        base = '/sys/bus/usb/devices'
+        for name in self.sysx.listdir(base):
+            d = posixpath.join(base, name)
+            if (self.sysx.read(posixpath.join(d, 'idVendor')) or '').strip() == '12d1' \
+                    and (self.sysx.read(posixpath.join(d, 'idProduct')) or '').strip() == '1506':
+                return d
+        return None
+
+    def run_rung_step(self, rung, step, now):
+        if rung == RUNG_COPS:
+            return self._heavy_at('AT+COPS=2' if step == 0 else 'AT+COPS=0')
+        if rung == RUNG_CFUN:
+            if step == 0:
+                self.pin_attempted = False
+                self._cancel_dial()
+                return self._heavy_at('AT+CFUN=0')
+            return self._heavy_at('AT+CFUN=1')
+        if rung == RUNG_RESET:
+            self.pin_attempted = False
+            self._cancel_dial()
+            return self._heavy_at('AT+CFUN=1,1')
+        if rung == RUNG_USB:
+            path = self._usb_sysfs_path()
+            if not path:
+                rlog.error('recovery: modem USB device not found in sysfs')
+                return 'impossible'
+            self.pin_attempted = False
+            self._cancel_dial()
+            self._stop_dhcp()
+            self.modem.close()
+            return 'sent' if self.sysx.spawn_detached([USB_RESET_HELPER, path]) else 'impossible'
+        return 'impossible'
+
+    def on_stuck(self, reason, snap):
+        if reason != 'at_mute':
+            self._log_diag()
+
+    def on_recovered(self, reason):
+        self._reset_backoff()
+        self.dial_failures = 0
+        if reason == 'traffic':
+            self.probe_redials = 0
+            self.probe_exhausted = False
+
+    def verify_dial(self, now):
+        if self.reg_status in REGISTERED and self._connect_wanted():
+            rlog.info('recovery: [dial] verification dial')
+            return self._dial_start(now)
+        return False
+
+    def traffic_ok(self):
+        """Synchronous probe, used once at the end of the traffic ladder."""
+        if not self.cfg.probe_hosts:
+            return True
+        for host in self.cfg.probe_hosts:
+            if self.sysx.ping(host, IFACE):
+                self.probe_failures = 0
+                self.probe_redials = 0
+                self.probe_exhausted = False
+                return True
+        return False
+
+    def on_traffic_exhausted(self, now):
+        self.probe_suspended_until = now + PROBE_SUSPEND * self.cfg.timescale
+        self.probe_failures = 0
+        self.probe_redials = 0
+        self.probe_exhausted = False
+        log.error('connectivity probe to %s never recovers, suspended for %s. If your '
+                  'operator filters ICMP, set PROBE_HOST= (empty) in %s',
+                  ','.join(self.cfg.probe_hosts),
+                  fmt_duration(PROBE_SUSPEND * self.cfg.timescale), CONFIG_FILE)
+
+    # ---- periodic update -----------------------------------------------------
+
+    def _step(self, name, fn):
         try:
-            if not self.identified:
-                self._identify()
-            self._update_status()
-            self._watchdog()
-        except Exception as e:
-            log.error('Update error: %s', e)
+            fn()
+        except Exception:
+            log.exception('update step %s failed', name)
+
+    def _publish_recovery(self, now):
+        for path, value in self.recovery.describe(now).items():
+            if self.dbus[path] != value:
+                self.dbus[path] = value
+
+    def _update(self):
+        """Periodic update called by GLib. Every step is isolated: one failure
+        never stalls the others."""
+        now = time.monotonic()
+        if not self.identified:
+            self._step('identify', self._identify)
+        self._step('status', self._update_status)
+        self._step('dial', lambda: self._poll_dial(now))
+        self._step('session', lambda: self._track_session(now))
+        self._step('recovery', lambda: (self.recovery.observe(self._snapshot(), now),
+                                        self.recovery.tick(now)))
+        if self.recovery.allows_session_watchdog(now):
+            self._step('watchdog', lambda: self._session_watchdog(now))
+        self._step('publish', lambda: self._publish_recovery(now))
         return True
 
 
 def sigterm(s, f):
-    global mainloop
+    global mainloop, service
     log.info('Signal received, stopping')
+    if service is not None:
+        service.stop()
     mainloop.quit()
 
 
+def setup_recovery_log():
+    """Persistent journal of the recovery ladder, in addition to the multilog
+    (which changes directory whenever the tty gets a new number)."""
+    try:
+        os.makedirs(RECOVERY_LOG_DIR, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(RECOVERY_LOG, maxBytes=262144, backupCount=2)
+        handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)-8s %(message)s'))
+        rlog.addHandler(handler)
+    except Exception as e:
+        log.warning('no persistent recovery log: %s', e)
+
+
+service = None
+
+
 def main():
-    global mainloop
+    global mainloop, service
 
     if len(sys.argv) < 3 or sys.argv[1] != '-s':
         print('Usage: dbus-modem-e3372.py -s /dev/ttyUSBx')
         sys.exit(1)
 
     dev = sys.argv[2]
-    log.info('Starting dbus-modem-e3372 %s on %s', VERSION, dev)
+    logging.basicConfig(format='%(levelname)-8s %(message)s', level=logging.INFO)
+    setup_recovery_log()
+    cfg = Config()
+    log.info('Starting dbus-modem-e3372 %s on %s (probe %s, recovery level %d, timescale %g)',
+             VERSION, dev, ','.join(cfg.probe_hosts) or 'off', cfg.recovery_level, cfg.timescale)
 
     signal.signal(signal.SIGINT, sigterm)
     signal.signal(signal.SIGTERM, sigterm)
 
     mainloop = GLib.MainLoop()
 
-    svc = ModemService(dev)
-    if not svc.start():
+    service = ModemService(dev, cfg)
+    if not service.start():
         sys.exit(1)
 
     log.info('Modem service running')
     mainloop.run()
 
-    svc.modem.close()
+    service.modem.close()
     log.info('Stopped')
 
 

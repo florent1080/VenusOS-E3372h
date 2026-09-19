@@ -8,6 +8,7 @@
 #   - Replacement start-modem.sh for serial-starter (via FileSets)
 #   - udev rules for hotplug
 #   - NCM connect script
+#   - USB reset helper (recovery ladder)
 #   - Default config file (preserves existing)
 
 packageDir="$(dirname "$(realpath "$0")")"
@@ -45,6 +46,16 @@ if [ $scriptAction == 'INSTALL' ] ; then
     chmod +x /data/e3372_connect.sh
     logMessage "NCM connect script installed"
 
+    # Install USB reset helper (last rung of the recovery ladder, launched
+    # detached by the modem service)
+    cp "$packageDir/e3372_usb_reset.sh" /data/e3372_usb_reset.sh
+    sed -i 's/\r//g' /data/e3372_usb_reset.sh
+    chmod +x /data/e3372_usb_reset.sh
+    logMessage "USB reset helper installed"
+
+    # Persistent recovery journal
+    mkdir -p /data/log/e3372
+
     # Install config file (only if not already present — preserve user edits)
     if [ ! -f /data/e3372-config.conf ] ; then
         cp "$packageDir/e3372-config.conf" /data/e3372-config.conf
@@ -78,6 +89,10 @@ if [ $scriptAction == 'UNINSTALL' ] ; then
     # Remove NCM connect script
     rm -f /data/e3372_connect.sh
     logMessage "NCM connect script removed"
+
+    # Remove USB reset helper (the recovery journal in /data/log/e3372 is kept)
+    rm -f /data/e3372_usb_reset.sh
+    logMessage "USB reset helper removed"
 
     # Note: /data/e3372-config.conf is NOT removed (user data)
     logMessage "config file preserved (/data/e3372-config.conf)"

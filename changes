@@ -1,3 +1,41 @@
+v1.3
+    New: recovery ladder for every state in which the modem cannot be
+        dialled. The watchdog used to give up silently whenever the modem
+        was not registered (CREG 0/2/3/4): a "Registration denied" from the
+        network left the GX offline for 11 days, until a reboot. It now
+        escalates, after a grace period, through a network re-selection
+        (AT+COPS=2/0), a radio cycle (AT+CFUN=0/1), a modem reset
+        (AT+CFUN=1,1) and a USB port reset, with a growing pause between
+        full ladders (15 min doubling up to 4 h) and never more than two
+        destructive resets per 30 min. The same ladder covers a mute AT
+        port, a missing or failed SIM, a data session that will not dial,
+        and a session that passes no traffic. The GX itself is never
+        rebooted: every action is confined to the modem.
+    New: RECOVERY_LEVEL (0-4, 0 = observe only) and RECOVERY_TIMESCALE in
+        /data/e3372-config.conf. Heavy commands go through /dev/cdc-wdm0 so
+        that a slow answer never blocks the service.
+    New: SIM PIN sent from /Settings/Modem/PIN, once; a wrong PIN clears the
+        setting (three wrong attempts would lock the SIM). /SimStatus now
+        uses the codes the GUI displays (no SIM, PIN, PUK, failure, ...).
+    New: recovery state persisted in /run (survives a service restart, not a
+        reboot), persistent journal in /data/log/e3372/recovery.log,
+        /Recovery/* and /Signal/* paths on D-Bus, signal quality
+        (RSSI/RSRP/SINR/RSRQ) logged every minute and on every transition.
+    Fix: the dial no longer blocks the service for up to 22 s. The previous
+        session is confirmed down before the new one is requested, and the
+        re-dial backoff is only reset after 60 s of stable session: 40% of
+        the drops used to be a fresh session dying seconds after the dial,
+        re-dialled every 30 s.
+    Fix: a service restart keeps a session that is already up instead of
+        re-dialling it (and cutting the remote access with it).
+    Fix: a stale DHCP client no longer blocks the address forever.
+    Fix: the connectivity probe accepts several hosts and is suspended for
+        6 h instead of being disabled for good.
+    Fix: unsolicited modem reports (^RSSI, ^HCSQ, ^MODE, ...) can no longer
+        be mistaken for a response; AT^CURC=0 at start.
+    Fix: status polling stops at the first timeout, so a mute modem costs
+        one timeout per poll instead of six.
+
 v1.2
     Fix: /PPPStatus now follows the Victron PPP_STATUS enum (0 down,
         1 connecting, 2 up). The session-up state was published as 1,
