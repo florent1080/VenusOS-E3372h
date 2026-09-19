@@ -130,6 +130,11 @@ RUNG_CFUN = 'CFUN_CYCLE'    # AT+CFUN=0 then AT+CFUN=1: radio off/on
 RUNG_RESET = 'CFUN_RESET'   # AT+CFUN=1,1: full modem reset (re-enumerates USB)
 RUNG_USB = 'USB_RESET'      # de-authorize / re-authorize the USB device
 RUNG_MIN_LEVEL = {RUNG_COPS: 1, RUNG_CFUN: 2, RUNG_RESET: 3, RUNG_USB: 4}
+# Steps the firmware may legitimately refuse without the rung being pointless.
+# The E3372h (21.180) answers "+CME ERROR: 50" to AT+COPS=2, but still accepts
+# AT+COPS=0 - and that is the command that actually repairs a stuck or manual
+# network selection. Refusing the whole rung on the first step would skip it.
+RUNG_BEST_EFFORT = {(RUNG_COPS, 0)}
 RUNG_DESTRUCTIVE = (RUNG_RESET, RUNG_USB)
 RUNG_STEPS = {RUNG_COPS: 2, RUNG_CFUN: 2, RUNG_RESET: 1, RUNG_USB: 1}
 SETTLE = {RUNG_COPS: 90, RUNG_CFUN: 120, RUNG_RESET: 180, RUNG_USB: 180}
@@ -821,6 +826,10 @@ class Recovery:
         rlog.warning('recovery: [%s] ladder #%d rung %d/%d %s step %d -> %s',
                      self.reason, self.ladder_count + 1, self.rung_idx + 1, len(ladder),
                      rung, (self.step if not destructive else 0) + 1, result)
+        if result != 'sent' and not destructive and self.step + 1 < nsteps                 and (rung, self.step) in RUNG_BEST_EFFORT:
+            rlog.info('recovery: [%s] step %d of %s is optional, carrying on',
+                      self.reason, self.step + 1, rung)
+            result = 'sent'
         if result == 'sent':
             if destructive:
                 return

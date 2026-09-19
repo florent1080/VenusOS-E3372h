@@ -93,6 +93,32 @@ class DeniedLadderTests(unittest.TestCase):
         self.assertEqual(b.dbus('/Connected'), 1)
         self.assertTrue(any(h['result'] == 'recovered' for h in b.svc.recovery.history))
 
+    def test_cops2_refused_by_firmware_still_sends_cops0(self):
+        # The real E3372h answers "+CME ERROR: 50" to AT+COPS=2. The rung must
+        # carry on to AT+COPS=0, which is the command that actually repairs a
+        # stuck network selection.
+        b = harness.Bench()
+        b.modem.creg = 3
+        b.modem.on('AT+COPS=2', lambda c: ['+CME ERROR: 50'])
+        b.modem.on('AT+COPS=0', lambda c: (b.modem.schedule(20, creg=1), ['OK'])[1])
+        b.start()
+        b.run(20 * 60)
+        self.assertEqual(b.heavy_cmds(), ['AT+COPS=2', 'AT+COPS=0'])
+        self.assertTrue(b.logs('step 1 of COPS_CYCLE is optional, carrying on'))
+        self.assertTrue(b.logs('recovered at rung 1/4 COPS_CYCLE'))
+        self.assertEqual(b.dbus('/Connected'), 1)
+
+    def test_whole_rung_refused_goes_to_the_next_one(self):
+        b = harness.Bench()
+        b.modem.creg = 3
+        b.modem.on('AT+COPS=', lambda c: ['+CME ERROR: 50'])
+        b.modem.creg_after_cfun = 1
+        b.start()
+        b.run(20 * 60)
+        cmds = b.heavy_cmds()
+        self.assertEqual(cmds[:4], ['AT+COPS=2', 'AT+COPS=0', 'AT+CFUN=0', 'AT+CFUN=1'])
+        self.assertTrue(b.logs('recovered at rung 2/4 CFUN_CYCLE'))
+
     def test_reason_change_and_clear_are_logged(self):
         b = harness.Bench()
         b.modem.creg = 3
