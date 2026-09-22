@@ -4,49 +4,61 @@
 #
 # WHY THIS EXISTS
 # The recovery ladder of dbus-modem-e3372.py talks to the modem through its
-# tty (and /dev/cdc-wdm0). Both vanish when the modem leaves the USB bus, and
-# serial-starter then kills the service - so the very component that knows how
-# to reset the USB port is gone exactly when that reset is needed. A modem
-# that drops off the bus (or that a command such as AT+CFUN=0 switched off
-# before the follow-up could be sent) would stay dead until someone unplugs it.
+# tty. That tty disappears whenever the modem leaves the USB bus, and
+# serial-starter then kills the service - so the component that knows how to
+# recover is gone exactly when recovery is needed. This script is started
+# detached by the service (new session, no inherited descriptors), so it
+# outlives that, and it is the layer that repairs a half-finished USB action.
 #
-# This script is that missing piece: it is started detached by the modem
-# service (new session, no inherited descriptor), so it survives the service
-# being killed, and it only ever does one thing - power-cycle the modem's USB
-# port when the link has been dead for a long time.
+# ORDER MATTERS: talk to the modem first, touch USB second. On 2026-09-19 the
+# ladder performed two USB re-enumerations while AT^RESET - the command that
+# actually restarts this firmware - was available on /dev/cdc-wdm0 the whole
+# time and was never tried. It never re-authorised its way out, because no
+# host-side action changes anything inside the modem.
 #
-# It is deliberately dumb and slow: one check every few minutes, one action per
-# half hour at most, and nothing at all while the data session is alive.
+# It never reboots the GX.
 
 CONF=/data/e3372-config.conf
 LOG=/data/log/e3372/linkwatch.log
 PIDFILE=/var/run/e3372-linkwatch.pid
+INTENT=/run/e3372-intent.json
+LAST_DESTRUCTIVE=/run/e3372-last-destructive
+RECOVERY_STATE=/run/e3372-recovery.json
+BOOT_ID_FILE=/proc/sys/kernel/random/boot_id
+UPTIME_FILE=/proc/uptime
 USB_RESET=/data/e3372_usb_reset.sh
+AT=/data/e3372_at.py
 IFACE=wwan0
 
 CHECK_INTERVAL=60          # seconds between checks
-DOWN_BEFORE_ACT=900        # link must be dead this long before acting
-MIN_GAP=1800               # never act more often than this
-HCI_RESET=0                # rebind the USB controller when the modem is gone
+STEP1_AFTER=600            # link dead this long before the first action
+STEP_GAP=600               # between escalation steps
+DESTRUCTIVE_GAP=900        # shared with the service's own ladder
+HCI_GAP=21600              # at most one controller rebind per 6 h
+HCI_RESET=1                # the controller carrying the modem only
 
-[ -f "$CONF" ] && . "$CONF" 2>/dev/null
-[ -n "$LINKWATCH_DOWN_SECONDS" ] && DOWN_BEFORE_ACT=$LINKWATCH_DOWN_SECONDS
-[ -n "$LINKWATCH_HCI_RESET" ] && HCI_RESET=$LINKWATCH_HCI_RESET
+mkdir -p /data/log/e3372 2>/dev/null
+say() { echo "$(date) [$(cut -d. -f1 "$UPTIME_FILE" 2>/dev/null)] - $*" >> "$LOG"; }
 
-mkdir -p /data/log/e3372
-say() { echo "$(date) - $*" >> "$LOG"; }
+# The config is edited by hand, on Windows, and a stray CR or a syntax error
+# would either disarm this watchdog or execute arbitrary shell if we sourced
+# it. Read it key by key instead, and fall back to the default on anything
+# that is not a plain number.
+conf_get() {
+    v=$(sed -n "s/^[ 	]*$1[ 	]*=[ 	]*//p" "$CONF" 2>/dev/null \
+        | tail -n 1 | tr -d '\r' | sed 's/^"//; s/"$//; s/^'\''//; s/'\''$//')
+    case "$v" in
+        ''|*[!0-9]*) echo "$2" ;;
+        *)           echo "$v" ;;
+    esac
+}
 
-# Single instance, even across restarts of the modem service.
-if [ -f "$PIDFILE" ]; then
-    old=$(cat "$PIDFILE" 2>/dev/null)
-    if [ -n "$old" ] && [ -d "/proc/$old" ]; then
-        exit 0
-    fi
-fi
-echo $$ > "$PIDFILE"
-trap 'rm -f "$PIDFILE"' EXIT INT TERM
+[ -f "$CONF" ] && {
+    STEP1_AFTER=$(conf_get LINKWATCH_DOWN_SECONDS "$STEP1_AFTER")
+    HCI_RESET=$(conf_get LINKWATCH_HCI_RESET "$HCI_RESET")
+}
 
-say "linkwatch started (pid $$, act after ${DOWN_BEFORE_ACT}s, hci_reset=$HCI_RESET)"
+now_s() { cut -d. -f1 "$UPTIME_FILE"; }   # monotonic: this GX has no NTP
 
 modem_sysfs() {
     for f in /sys/bus/usb/devices/*/idProduct; do
@@ -61,80 +73,185 @@ modem_sysfs() {
 }
 
 connect_wanted() {
-    # Respect the UI switch. When the D-Bus answer is unavailable (the service
-    # may be dead, which is precisely the case we are here for), assume yes.
     v=$(dbus -y com.victronenergy.settings /Settings/Modem/Connect GetValue 2>/dev/null)
     [ "$v" = "0" ] && return 1
     return 0
 }
 
 link_alive() {
-    # An address plus a default route through wwan0 is the cheapest proof that
-    # the data session exists. The address alone is not: it survives a drop.
     ip -4 addr show "$IFACE" 2>/dev/null | grep -q 'inet ' || return 1
     ip route 2>/dev/null | grep -q "^default.*dev $IFACE" || return 1
     return 0
 }
 
-hci_reset() {
-    # The modem is not on the bus any more: rebind its USB controller, which is
-    # the closest thing to re-plugging the cable. This also re-enumerates the
-    # other devices of that controller, so it stays opt-in.
-    drv=/sys/bus/platform/drivers/xhci-hcd
-    [ -d "$drv" ] || { say "no xhci-hcd driver, cannot rebind"; return 1; }
-    for hci in $(ls "$drv" 2>/dev/null | grep -E '^xhci-hcd'); do
-        say "rebinding USB controller $hci"
-        echo "$hci" > "$drv/unbind" 2>/dev/null
-        sleep 5
-        echo "$hci" > "$drv/bind" 2>/dev/null
-        sleep 20
-        if modem_sysfs > /dev/null; then
-            say "modem is back on the bus after rebinding $hci"
-            return 0
-        fi
-    done
-    return 1
+service_is_busy() {
+    # The service persists its ladder state; while it is mid-rung, stay out of
+    # the way so the two can never act at the same time.
+    [ -f "$RECOVERY_STATE" ] || return 1
+    grep -q '"state": *"rung"' "$RECOVERY_STATE" 2>/dev/null
 }
 
+destructive_allowed() {
+    [ -f "$LAST_DESTRUCTIVE" ] || return 0
+    last=$(cat "$LAST_DESTRUCTIVE" 2>/dev/null)
+    case "$last" in ''|*[!0-9]*) return 0 ;; esac
+    [ $(( $(now_s) - last )) -ge "$DESTRUCTIVE_GAP" ]
+}
+
+mark_destructive() { now_s > "$LAST_DESTRUCTIVE"; }
+
+# Role 0: repair a half-finished USB action. This is the layer that survives
+# the helper being killed between its two writes.
+repair_intent() {
+    [ -f "$INTENT" ] || return 0
+    boot=$(cat "$BOOT_ID_FILE" 2>/dev/null)
+    grep -q "\"boot_id\":\"$boot\"" "$INTENT" 2>/dev/null || {
+        rm -f "$INTENT"
+        return 0
+    }
+    undo_at=$(sed -n 's/.*"undo_at":\([0-9]*\).*/\1/p' "$INTENT" | tail -n 1)
+    case "$undo_at" in ''|*[!0-9]*) rm -f "$INTENT"; return 0 ;; esac
+    [ "$(now_s)" -gt $((undo_at + 10)) ] || return 0
+
+    target=$(sed -n 's/.*"target":"\([^"]*\)".*/\1/p' "$INTENT" | tail -n 1)
+    peer=$(sed -n 's/.*"peer":"\([^"]*\)".*/\1/p' "$INTENT" | tail -n 1)
+    ufile=$(sed -n 's/.*"undo_file":"\([^"]*\)".*/\1/p' "$INTENT" | tail -n 1)
+    uval=$(sed -n 's/.*"undo_value":"\([^"]*\)".*/\1/p' "$INTENT" | tail -n 1)
+    say "CRITICAL: a USB action was left unfinished, undoing it ($target/$ufile=$uval)"
+    [ -n "$target" ] && [ -n "$ufile" ] && echo "$uval" > "$target/$ufile" 2>/dev/null
+    [ -n "$peer" ] && echo "$uval" > "$peer/$ufile" 2>/dev/null
+    dev=$(modem_sysfs)
+    [ -n "$dev" ] && echo 1 > "$dev/authorized" 2>/dev/null
+    rm -f "$INTENT"
+}
+
+at_reset() {
+    [ -x "$AT" ] || { say "no $AT, cannot talk to the modem"; return 1; }
+    [ -c /dev/cdc-wdm0 ] || { say "no /dev/cdc-wdm0, cannot talk to the modem"; return 1; }
+    cfun=$("$AT" 'AT+CFUN?' 2>/dev/null | sed -n 's/.*+CFUN: *\([0-9]*\).*/\1/p' | tail -n 1)
+    say "modem says CFUN=${cfun:-?}"
+    if [ -n "$cfun" ] && [ "$cfun" != "1" ]; then
+        say "radio is off, switching it on"
+        "$AT" 'AT+CFUN=1' >> "$LOG" 2>&1
+        sleep 20
+        link_alive && return 0
+    fi
+    say "sending AT^RESET (the only command measured to restart this firmware)"
+    "$AT" 'AT^RESET' >> "$LOG" 2>&1
+    mark_destructive
+    sleep 45
+    link_alive
+}
+
+# The test bench sources this file to exercise the helpers below against a
+# fake sysfs tree; it must stop before taking the pidfile and entering the
+# loop. In normal use the variable is unset and this is a no-op.
+if [ -n "$LINKWATCH_SOURCE_ONLY" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+# Single instance, even across restarts of the modem service.
+if [ -f "$PIDFILE" ]; then
+    old=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$old" ] && [ -d "/proc/$old" ]; then
+        exit 0
+    fi
+fi
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT INT TERM
+
+say "linkwatch started (pid $$, first action after ${STEP1_AFTER}s, hci_reset=$HCI_RESET)"
+
 down_since=0
-last_action=0
-now=0
+step=0
+last_step_at=0
+last_hci=0
+cycle=0
+backoff=0
 
 while true; do
     sleep "$CHECK_INTERVAL"
-    now=$((now + CHECK_INTERVAL))
+    now=$(now_s)
+
+    repair_intent
 
     if ! connect_wanted; then
-        down_since=0
+        down_since=0; step=0
         continue
     fi
 
     if link_alive; then
         if [ "$down_since" != 0 ]; then
-            say "link is back after $((now - down_since))s"
+            say "link is back after $((now - down_since))s (at step $step)"
         fi
         down_since=0
+        # A full hour of health resets the escalation and the backoff.
+        if [ "$step" != 0 ] && [ $((now - last_step_at)) -ge 3600 ]; then
+            step=0; backoff=0
+        fi
         continue
     fi
 
     [ "$down_since" = 0 ] && { down_since=$now; say "link down, watching"; }
-    [ $((now - down_since)) -lt "$DOWN_BEFORE_ACT" ] && continue
-    [ "$last_action" != 0 ] && [ $((now - last_action)) -lt "$MIN_GAP" ] && continue
+    [ $((now - down_since)) -lt "$STEP1_AFTER" ] && continue
+    [ "$last_step_at" != 0 ] && [ $((now - last_step_at)) -lt "$STEP_GAP" ] && continue
+    service_is_busy && { say "the service is mid-rung, standing by"; continue; }
 
-    last_action=$now
+    step=$((step + 1))
+    last_step_at=$now
     dev=$(modem_sysfs)
-    if [ -n "$dev" ]; then
-        say "link dead for $((now - down_since))s, resetting the USB port ($dev)"
-        [ -x "$USB_RESET" ] && "$USB_RESET" "$dev"
-    else
-        say "link dead for $((now - down_since))s and the modem is not on the USB bus"
-        if [ "$HCI_RESET" = "1" ]; then
-            hci_reset
-        else
-            say "set LINKWATCH_HCI_RESET=1 in $CONF to rebind the USB controller"
+
+    case "$step" in
+    1)
+        say "step 1: talking to the modem (down for $((now - down_since))s)"
+        at_reset && { say "recovered by AT^RESET"; step=0; continue; }
+        ;;
+    2)
+        if ! destructive_allowed; then
+            say "step 2 held: the service reset something less than ${DESTRUCTIVE_GAP}s ago"
+            step=1
+            continue
         fi
-    fi
-    # Give the modem time to enumerate and the service time to dial before the
-    # next judgement.
-    down_since=$now
+        say "step 2: USB re-enumeration"
+        mark_destructive
+        [ -x "$USB_RESET" ] && "$USB_RESET" portcycle "$dev" >> "$LOG" 2>&1
+        sleep 20
+        ;;
+    3)
+        say "step 3: AT^RESET again, the modem may answer after the re-enumeration"
+        at_reset && { say "recovered by AT^RESET"; step=0; continue; }
+        ;;
+    4)
+        if [ "$HCI_RESET" != "1" ]; then
+            say "step 4 skipped: LINKWATCH_HCI_RESET is not 1"
+        elif [ "$last_hci" != 0 ] && [ $((now - last_hci)) -lt "$HCI_GAP" ]; then
+            say "step 4 held: the controller was rebound $((now - last_hci))s ago"
+        else
+            say "step 4: rebinding the modem's USB controller"
+            last_hci=$now
+            mark_destructive
+            [ -x "$USB_RESET" ] && "$USB_RESET" rebind "$dev" >> "$LOG" 2>&1
+            sleep 30
+        fi
+        ;;
+    *)
+        # Round finished without recovery: wait longer and start again. Never
+        # give up, never reboot.
+        cycle=$((cycle + 1))
+        backoff=$((1800 * cycle))
+        [ "$backoff" -gt 14400 ] && backoff=14400
+        say "a full round did not recover the link; next round in ${backoff}s"
+        i=0
+        while [ $i -lt "$backoff" ]; do
+            sleep "$CHECK_INTERVAL"
+            i=$((i + CHECK_INTERVAL))
+            repair_intent
+            if link_alive; then
+                say "link came back on its own during the backoff"
+                break
+            fi
+        done
+        step=0
+        ;;
+    esac
 done

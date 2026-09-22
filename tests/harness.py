@@ -121,7 +121,15 @@ class Bench:
     def heavy(self):
         """Recovery commands received by the modem: (t, channel, cmd)."""
         return [x for x in self.modem.sent
-                if x[2].startswith(('AT+COPS=', 'AT+CFUN='))]
+                if x[2].startswith(('AT+COPS=', 'AT+CFUN=', 'AT^RESET'))
+                and x[2] != 'AT+CFUN?']
+
+    def spawned(self, action=None):
+        """Detached helper invocations, optionally filtered by action."""
+        out = [a for a in self.system.spawned if 'usb_reset' in str(a[0])]
+        if action:
+            out = [a for a in out if len(a) > 1 and a[1] == action]
+        return out
 
     def heavy_cmds(self):
         return [x[2] for x in self.heavy()]

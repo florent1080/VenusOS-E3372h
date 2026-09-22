@@ -43,7 +43,7 @@ class SessionTests(unittest.TestCase):
         self.assertGreaterEqual(b.svc.dial_failures, 5)
         self.assertTrue(b.logs('session: dial failed, session still down (5 consecutive)'))
         self.assertTrue(b.logs('recovery: [dial] stuck (5 consecutive dial failures)'))
-        self.assertEqual(b.heavy_cmds()[:2], ['AT+COPS=2', 'AT+COPS=0'])
+        self.assertEqual([c[2] for c in b.heavy()][:1], ['AT+COPS=0'])
         # after the settle time a verification dial is made before judging
         b.run(3 * 60)
         self.assertTrue(b.logs('recovery: [dial] verification dial'))
@@ -53,9 +53,9 @@ class SessionTests(unittest.TestCase):
         b2.modem.on('AT+COPS=0', lambda c: (setattr(b2.modem, 'ndisdup_auto_up', True), ['OK'])[1])
         b2.start()
         b2.run(12 * 60)
-        self.assertTrue(b2.logs('recovered at rung 1/4 COPS_CYCLE'))
+        self.assertTrue(b2.logs('recovered at rung 1/3 COPS_AUTO'), b2.logs('recovery:'))
         self.assertEqual(b2.dbus('/Connected'), 1)
-        self.assertNotIn('AT+CFUN=0', b2.heavy_cmds())
+        self.assertEqual(b2.modem.firmware_resets, 0)
 
     def test_double_drop_keeps_the_backoff(self):
         b = harness.Bench()

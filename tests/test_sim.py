@@ -47,17 +47,21 @@ class SimPinTests(unittest.TestCase):
         self.assertLessEqual(len(nags), 4)
         self.assertEqual(b.dbus('/SimStatus'), 11)
 
-    def test_sim_relocks_after_radio_cycle(self):
+    def test_sim_relocks_after_a_modem_reset(self):
         b = harness.Bench(settings={'pin': '1234'})
-        b.modem.pin = '1234'          # SIM locked, but already unlocked at start
-        b.modem.creg = 3              # forces a ladder with a CFUN cycle
-        b.modem.creg_after_cfun = 1
+        b.modem.pin = '1234'          # SIM locked, already unlocked at start
+        b.modem.creg = 3              # forces a ladder that reaches the reset
+        b.modem.creg_after_reset = 1
         b.start()
         b.run(20 * 60)
-        self.assertIn('AT+CFUN=1', b.heavy_cmds())
-        self.assertEqual(len(b.modem.sent_cmds('AT+CPIN=')), 1)
+        reset_at = [c[0] for c in b.heavy() if c[2] == 'AT^RESET']
+        self.assertTrue(reset_at)
+        pins = b.modem.sent_cmds('AT+CPIN=')
+        self.assertEqual(len(pins), 1, pins)
+        self.assertGreater(pins[0][0], reset_at[0],
+                           'the PIN must be sent again after the modem restarted')
         self.assertEqual(b.dbus('/SimStatus'), 1000)
-        self.assertTrue(b.logs('recovered at rung 2/4 CFUN_CYCLE'))
+        self.assertEqual(b.dbus('/Connected'), 1)
 
 
 class SimStateTests(unittest.TestCase):
@@ -69,11 +73,12 @@ class SimStateTests(unittest.TestCase):
         self.assertEqual(b.dbus('/SimStatus'), 10)
         self.assertEqual(b.dbus('/Connected'), 0)
         b.run(4 * 60)
-        self.assertEqual(b.heavy_cmds(), [])          # 5 min grace
+        self.assertEqual(b.heavy(), [])               # 5 min grace
         self.assertTrue(b.logs('recovery: [sim] stuck (SIM no SIM)'))
         b.run(3 * 60)
-        self.assertEqual(b.heavy_cmds()[:2], ['AT+CFUN=0', 'AT+CFUN=1'])
-        # SIM back after the modem reset
+        # the sim ladder goes straight to the reset: no AT command can
+        # conjure a SIM back, only a restart might.
+        self.assertEqual([c[2] for c in b.heavy()], ['AT^RESET'])
         b.modem.cpin = 'READY'
         b.run(10 * 60)
         self.assertTrue(b.logs('recovered at rung'))

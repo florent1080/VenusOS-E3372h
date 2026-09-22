@@ -5,6 +5,9 @@ import types
 
 PIDFILE = '/var/run/udhcpc.wwan0.pid'
 SYSFS_DEV = '/sys/bus/usb/devices/3-1'
+SYSFS_PORT = '/sys/bus/usb/devices/usb3/3-0:1.0/usb3-port1'
+SYSFS_PEER = '/sys/bus/usb/devices/usb4/4-0:1.0/usb4-port1'
+HCI = 'xhci-hcd.1'
 
 
 class FakeSystem:
@@ -16,6 +19,11 @@ class FakeSystem:
             SYSFS_DEV + '/idVendor': '12d1\n',
             SYSFS_DEV + '/idProduct': '1506\n',
             SYSFS_DEV + '/authorized': '1\n',
+            SYSFS_PORT + '/disable': '0\n',
+            SYSFS_PORT + '/state': 'configured\n',
+            SYSFS_PEER + '/disable': '0\n',
+            '/sys/bus/platform/drivers/xhci-hcd/' + HCI: '',
+            '/sys/bus/platform/drivers/xhci-hcd/xhci-hcd.0': '',
         }
         self.calls = []        # (t, kind, detail)
         self.writes = []       # (t, path, text)
@@ -25,6 +33,8 @@ class FakeSystem:
         self.ip = ''
         self.udhcpc_pid = None
         self.next_pid = 1000
+        self.rx_bytes = 1000
+        self.port_write_fails = False
         self.live_pids = set()
 
     def _t(self):
@@ -54,7 +64,22 @@ class FakeSystem:
         return types.SimpleNamespace(stdout='', returncode=0)
 
     def read(self, path):
+        if path == SYSFS_DEV + '/devnum':
+            return None if self.modem.died else '%d\n' % self.modem.devnum
+        if path.endswith('/statistics/rx_bytes'):
+            return '%d\n' % self.rx_bytes
         return self.files.get(path)
+
+    def write(self, path, text):
+        """Plain sysfs write (write_atomic cannot touch sysfs)."""
+        self.calls.append((self._t(), 'write', (path, text.strip())))
+        if self.port_write_fails and path.endswith('/disable'):
+            return False
+        self.files[path] = text
+        if path.endswith('/disable'):
+            self.files[SYSFS_PORT + '/state'] = (
+                'not attached\n' if text.strip() == '1' else 'configured\n')
+        return True
 
     def write_atomic(self, path, text):
         self.files[path] = text
@@ -86,11 +111,16 @@ class FakeSystem:
                 names.add(k[len(prefix):].split('/')[0])
         return sorted(names)
 
+    DEVPATH = ('/sys/devices/platform/axi/1000120000.pcie/1f00300000.usb/'
+               'xhci-hcd.1/usb3/3-1')
+
     def realpath(self, path):
+        if path == SYSFS_DEV:
+            return self.DEVPATH
         if path.startswith('/sys/class/tty/'):
-            return SYSFS_DEV + '/3-1:1.0/' + path.split('/')[4]
+            return self.DEVPATH + '/3-1:1.0/' + path.split('/')[4]
         if path.startswith('/sys/class/net/'):
-            return SYSFS_DEV + '/3-1:1.1'
+            return self.DEVPATH + '/3-1:1.1'
         return path
 
     def remove(self, path):
@@ -114,7 +144,9 @@ class FakeSystem:
         self.spawned.append(list(argv))
         if argv and str(argv[0]).endswith('e3372_usb_reset.sh'):
             self.remove(PIDFILE)
-            self.modem.reset()
+            # MEASURED: a host-side reset re-enumerates the device but
+            # leaves the firmware state (CFUN, the write lock) untouched.
+            self.modem.bus_reset()
         return True
 
     def ping(self, host, iface):

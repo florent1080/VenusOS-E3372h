@@ -1,21 +1,47 @@
 #!/bin/sh
-# /data/e3372_usb_reset.sh - USB-level reset of the Huawei E3372h
+# /data/e3372_usb_reset.sh - host-side re-enumeration of the E3372h
 # Part of VenusOS-E3372h package
 #
-# De-authorizes then re-authorizes the modem's USB device, which is what a
-# physical unplug/replug does. Last rung of the recovery ladder of
-# dbus-modem-e3372.py, which launches this script detached: as soon as the
-# device is de-authorized its tty disappears and serial-starter kills the
-# modem service, so the service itself could never write the "1" back.
+# WHAT THIS IS, AND WHAT IT IS NOT
+# This is a BUS reset, not a power cycle, and on this board it never will be.
+# Measured on 2026-09-22 (Raspberry Pi 5, xhci-hcd.1): the kernel really does
+# clear port power (PORTSC reads "Powered-off Not-connected Disabled") and the
+# device really leaves the bus - and the modem still came back 0.5 s later with
+# its firmware state intact (AT+CSCS still showed the value set before the
+# cycle). RP1's port-power output is not wired to a load switch. So
+# de-authorising, disabling the port and rebinding the controller are three
+# strengths of the same host-side act, and NONE of them changes anything
+# inside the modem. Use this when the driver or the enumeration is wedged; use
+# AT^RESET when the modem itself is.
 #
-# Usage: e3372_usb_reset.sh [/sys/bus/usb/devices/X-Y]
-# The sysfs path is rediscovered when missing or stale. Logs to /var/log/e3372.log.
+# Usage:
+#   e3372_usb_reset.sh portcycle [<device sysfs path>]
+#   e3372_usb_reset.sh rebind    [<device sysfs path>] [<xhci-hcd.N>]
+#   e3372_usb_reset.sh                 (defaults to portcycle)
+#
+# The modem service launches this detached, because the first write makes the
+# tty disappear and serial-starter then kills the service: nothing else would
+# be left to write the port back.
 
-LOG=/var/log/e3372.log
+LOG=/data/log/e3372/usbreset.log
+LINKLOG=/var/log/e3372.log
 PIDFILE=/var/run/udhcpc.wwan0.pid
-DEV="$1"
+INTENT=/run/e3372-intent.json
+BOOT_ID_FILE=/proc/sys/kernel/random/boot_id
+UPTIME_FILE=/proc/uptime
+GUARD_AFTER=60          # a forked child re-enables the port after this
+SETTLE=5                # the cut itself; longer is pointless, it is not power
+WAIT_BACK=30            # how long we wait for the device to come back
 
-exec >> "$LOG" 2>&1
+ACTION=${1:-portcycle}
+DEV=$2
+HCI=$3
+
+mkdir -p /data/log/e3372 2>/dev/null
+say() {
+    echo "$(date) - usb_reset[$ACTION]: $*" >> "$LOG"
+    echo "$(date) - usb_reset[$ACTION]: $*" >> "$LINKLOG"
+}
 
 find_dev() {
     for f in /sys/bus/usb/devices/*/idProduct; do
@@ -29,27 +55,165 @@ find_dev() {
     return 1
 }
 
-if [ -z "$DEV" ] || [ ! -f "$DEV/authorized" ]; then
-    DEV=$(find_dev)
-    if [ -z "$DEV" ]; then
-        echo "$(date) - usb_reset: E3372h not found in sysfs, nothing to do"
+# The port directory is found by resolving each candidate's 'device' symlink
+# and comparing it with the modem's own resolved path - never by name, which
+# differs behind an external hub.
+find_port() {
+    rp=$(readlink -f "$1")
+    hub=$(dirname "$rp")
+    for p in "$hub"/*/*-port*; do
+        [ -f "$p/disable" ] || continue
+        [ "$(readlink -f "$p/device" 2>/dev/null)" = "$rp" ] || continue
+        echo "$p"
+        return 0
+    done
+    return 1
+}
+
+find_hci() {
+    readlink -f "$1" | sed -n 's#.*/\(xhci-hcd\.[0-9]*\)/.*#\1#p'
+}
+
+write_intent() {
+    # Written BEFORE anything is taken down, so that whoever finds it can undo
+    # it: the linkwatch every minute, and the service at start-up. /run is a
+    # tmpfs, so a reboot clears it, which is also correct.
+    boot=$(cat "$BOOT_ID_FILE" 2>/dev/null)
+    up=$(cut -d. -f1 "$UPTIME_FILE")
+    cat > "$INTENT" <<EOF
+{"boot_id":"$boot","action":"$1","target":"$2","peer":"$3",
+ "undo_file":"$4","undo_value":"$5","undo_at":$((up + GUARD_AFTER))}
+EOF
+}
+
+clear_intent() { rm -f "$INTENT"; }
+
+stop_dhcp() {
+    # Otherwise e3372_connect.sh sees a live pidfile when the interface comes
+    # back and never restarts DHCP.
+    if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+        rm -f "$PIDFILE"
+    fi
+}
+
+wait_back() {
+    i=0
+    while [ $i -lt "$WAIT_BACK" ]; do
+        [ -n "$(find_dev)" ] && [ -c /dev/cdc-wdm0 ] && return 0
+        sleep 1
+        i=$((i + 1))
+    done
+    [ -n "$(find_dev)" ]
+}
+
+# ---------------------------------------------------------------------------
+
+[ -z "$DEV" ] || [ ! -f "$DEV/idVendor" ] && DEV=$(find_dev)
+if [ -z "$DEV" ]; then
+    say "the modem is not on the USB bus at all"
+    # Nothing to cycle: the only remaining host-side lever is the controller.
+    [ "$ACTION" = "portcycle" ] && ACTION=rebind
+fi
+
+OLDNUM=$(cat "$DEV/devnum" 2>/dev/null)
+say "starting (dev=${DEV:-none} devnum=${OLDNUM:-none})"
+
+case "$ACTION" in
+portcycle)
+    PORT=$(find_port "$DEV")
+    if [ -z "$PORT" ]; then
+        say "no port directory for $DEV, falling back to authorized"
+        stop_dhcp
+        echo 0 > "$DEV/authorized" && sleep "$SETTLE" && echo 1 > "$DEV/authorized"
+        wait_back && say "device back after the authorize fallback" \
+                  || say "device did NOT come back"
+        exit 0
+    fi
+    PEER=$(readlink -f "$PORT/peer" 2>/dev/null)
+    say "port=$PORT peer=${PEER:-none}"
+
+    write_intent portcycle "$PORT" "$PEER" disable 0
+    # Four independent layers make sure the port comes back up: this trap, the
+    # guard child below, the intent journal, and the fact that a reboot clears
+    # sysfs anyway.
+    trap 'echo 0 > "$PORT/disable" 2>/dev/null; [ -n "$PEER" ] && echo 0 > "$PEER/disable" 2>/dev/null; clear_intent' EXIT INT TERM HUP
+    ( sleep "$GUARD_AFTER"
+      if [ "$(cat "$PORT/disable" 2>/dev/null)" = "1" ]; then
+          echo 0 > "$PORT/disable" 2>/dev/null
+          [ -n "$PEER" ] && echo 0 > "$PEER/disable" 2>/dev/null
+          clear_intent
+          echo "$(date) - usb_reset: GUARD re-enabled $PORT" >> "$LOG"
+      fi ) &
+    GUARD=$!
+
+    stop_dhcp
+    # Both PORTSCs of the connector must go down together.
+    [ -n "$PEER" ] && echo 1 > "$PEER/disable" 2>/dev/null
+    if ! echo 1 > "$PORT/disable" 2>/dev/null; then
+        say "cannot write $PORT/disable, falling back to authorized"
+        kill "$GUARD" 2>/dev/null
+        trap - EXIT INT TERM HUP
+        clear_intent
+        echo 0 > "$DEV/authorized" 2>/dev/null
+        sleep "$SETTLE"
+        echo 1 > "$DEV/authorized" 2>/dev/null
+        wait_back && say "device back after the authorize fallback"
+        exit 0
+    fi
+    state=$(cat "$PORT/state" 2>/dev/null)
+    say "port state is now '$state'"
+    sleep "$SETTLE"
+    echo 0 > "$PORT/disable" 2>/dev/null
+    [ -n "$PEER" ] && echo 0 > "$PEER/disable" 2>/dev/null
+    clear_intent
+    kill "$GUARD" 2>/dev/null
+    trap - EXIT INT TERM HUP
+    ;;
+
+rebind)
+    [ -z "$HCI" ] && HCI=$(find_hci "$DEV")
+    DRV=/sys/bus/platform/drivers/xhci-hcd
+    if [ -z "$HCI" ] || [ ! -d "$DRV" ]; then
+        say "cannot work out the controller (hci='${HCI:-}'), nothing to do"
         exit 1
     fi
+    # Only ever the controller carrying the modem. Rebinding the other one
+    # would take out the VE.Direct adapters and the GPS.
+    say "rebinding controller $HCI"
+    write_intent rebind "$DRV" "" bind "$HCI"
+    trap 'echo "$HCI" > "$DRV/bind" 2>/dev/null; clear_intent' EXIT INT TERM HUP
+    ( sleep "$GUARD_AFTER"
+      if [ ! -e "$DRV/$HCI" ]; then
+          echo "$HCI" > "$DRV/bind" 2>/dev/null
+          clear_intent
+          echo "$(date) - usb_reset: GUARD re-bound $HCI" >> "$LOG"
+      fi ) &
+    GUARD=$!
+    stop_dhcp
+    echo "$HCI" > "$DRV/unbind" 2>/dev/null
+    sleep "$SETTLE"
+    echo "$HCI" > "$DRV/bind" 2>/dev/null
+    clear_intent
+    kill "$GUARD" 2>/dev/null
+    trap - EXIT INT TERM HUP
+    ;;
+
+*)
+    say "unknown action"
+    exit 1
+    ;;
+esac
+
+if wait_back; then
+    NEWDEV=$(find_dev)
+    NEWNUM=$(cat "$NEWDEV/devnum" 2>/dev/null)
+    if [ -n "$OLDNUM" ] && [ "$NEWNUM" = "$OLDNUM" ]; then
+        say "device is back but devnum is unchanged ($NEWNUM): nothing was reset"
+    else
+        say "device re-enumerated (devnum ${OLDNUM:-none} -> ${NEWNUM:-none})"
+    fi
+else
+    say "device did NOT come back within ${WAIT_BACK}s"
 fi
-
-echo "$(date) - usb_reset: de-authorizing $DEV"
-echo 0 > "$DEV/authorized"
-sleep 5
-
-# The DHCP client of the vanished interface would otherwise keep the pidfile
-# and block the relaunch by e3372_connect.sh.
-if [ -f "$PIDFILE" ]; then
-    kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
-    rm -f "$PIDFILE"
-fi
-
-echo "$(date) - usb_reset: re-authorizing $DEV"
-echo 1 > "$DEV/authorized"
-sleep 15
-
-echo "$(date) - usb_reset: done, ttys: $(ls /dev/ttyUSB* 2>/dev/null | tr '\n' ' ')wwan0 addresses: $(ip -4 addr show wwan0 2>/dev/null | grep -c inet)"
+say "done, wwan0 addresses: $(ip -4 addr show wwan0 2>/dev/null | grep -c inet)"

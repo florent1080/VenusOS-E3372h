@@ -42,7 +42,7 @@ import dbus.mainloop.glib
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = '1.3-e3372'
+VERSION = '1.4-e3372'
 
 CONFIG_FILE = '/data/e3372-config.conf'
 IFACE = 'wwan0'
@@ -52,6 +52,7 @@ STATE_FILE = '/run/e3372-recovery.json'
 USB_RESET_HELPER = '/data/e3372_usb_reset.sh'
 LINKWATCH_HELPER = '/data/e3372_linkwatch.sh'
 LINKWATCH_PIDFILE = '/var/run/e3372-linkwatch.pid'
+INTENT_FILE = '/run/e3372-intent.json'
 RECOVERY_LOG_DIR = '/data/log/e3372'
 RECOVERY_LOG = RECOVERY_LOG_DIR + '/recovery.log'
 BOOT_ID_FILE = '/proc/sys/kernel/random/boot_id'
@@ -75,7 +76,10 @@ HEALTHY_RESET_AFTER = 3600  # seconds of health before the ladder counter is cle
 LADDER_BACKOFF_MIN = 900    # seconds between two full ladders (first)
 LADDER_BACKOFF_MAX = 14400  # ceiling (4 h)
 DESTRUCTIVE_WINDOW = 1800   # no more than DESTRUCTIVE_MAX modem/USB resets per window
-DESTRUCTIVE_MAX = 2
+# A full ladder is exactly three destructive rungs (modem reset, USB
+# re-enumeration, controller rebind), so the budget must allow three or the
+# last rung is unreachable. Two full ladders inside the window stay impossible.
+DESTRUCTIVE_MAX = 3
 STEP_GAP = 10               # seconds between the two commands of a cycle rung
 VERIFY_WINDOW = 45          # seconds given to a verification dial
 TICK_ERRORS_MAX = 6         # recovery tick exceptions in a row before a self-reset
@@ -127,27 +131,49 @@ ACT_NAMES = {0: 'GSM', 1: 'GSM', 2: 'UMTS', 3: 'EDGE', 4: 'HSDPA', 5: 'HSUPA',
 
 # ---- recovery ladder ---------------------------------------------------------
 
-RUNG_COPS = 'COPS_CYCLE'    # AT+COPS=2 then AT+COPS=0: fresh network selection
-RUNG_CFUN = 'CFUN_CYCLE'    # AT+CFUN=0 then AT+CFUN=1: radio off/on
-RUNG_RESET = 'CFUN_RESET'   # AT+CFUN=1,1: full modem reset (re-enumerates USB)
-RUNG_USB = 'USB_RESET'      # de-authorize / re-authorize the USB device
-RUNG_MIN_LEVEL = {RUNG_COPS: 1, RUNG_CFUN: 2, RUNG_RESET: 3, RUNG_USB: 4}
-# Steps the firmware may legitimately refuse without the rung being pointless.
-# The E3372h (21.180) answers "+CME ERROR: 50" to AT+COPS=2, but still accepts
-# AT+COPS=0 - and that is the command that actually repairs a stuck or manual
-# network selection. Refusing the whole rung on the first step would skip it.
-RUNG_BEST_EFFORT = {(RUNG_COPS, 0)}
-RUNG_DESTRUCTIVE = (RUNG_RESET, RUNG_USB)
-RUNG_STEPS = {RUNG_COPS: 2, RUNG_CFUN: 2, RUNG_RESET: 1, RUNG_USB: 1}
-SETTLE = {RUNG_COPS: 90, RUNG_CFUN: 120, RUNG_RESET: 180, RUNG_USB: 180}
+RUNG_RADIO_ON = 'RADIO_ON'    # AT+CFUN=1, only when the radio is off
+RUNG_COPS = 'COPS_AUTO'       # AT+COPS=0: back to automatic network selection
+RUNG_RESET = 'MODEM_RESET'    # AT^RESET: the only command measured to restart
+                              # this firmware, and the only one measured to
+                              # escape the state AT+CFUN=4 leaves it in
+RUNG_USB = 'USB_REENUM'       # host-side bus reset: re-enumerates the device
+                              # but provably does NOT change its internal state
+RUNG_HCI = 'HCI_REBIND'       # unbind/bind the modem's own USB controller
+
+# Commands this package must never send. AT+CFUN=4 was measured, in situ, to
+# put the modem in a state where every configuration write is refused with
+# +CME ERROR: 100 - including the command that would undo it. AT+CFUN=0 is the
+# same class, AT+COPS=2 is refused by this firmware anyway, and AT+CGATT=0
+# detaches without a guaranteed way back. A watchdog must never create a state
+# it may not be able to leave.
+FORBIDDEN_PREFIXES = ('AT+CFUN=0', 'AT+CFUN=4', 'AT+CFUN=6', 'AT+CFUN=7',
+                      'AT+COPS=2', 'AT+CGATT=0', 'AT^RADIOOFF', 'AT^SYSCFG')
+
+RUNG_MIN_LEVEL = {RUNG_RADIO_ON: 1, RUNG_COPS: 1, RUNG_RESET: 2,
+                  RUNG_USB: 3, RUNG_HCI: 4}
+# Rungs that can take the modem (and this service with it) off the bus.
+RUNG_DESTRUCTIVE = (RUNG_RESET, RUNG_USB, RUNG_HCI)
+# Every rung is a single step: there is no window in which the service can be
+# killed between two halves of a sequence and leave the modem worse off.
+SETTLE = {RUNG_RADIO_ON: 60, RUNG_COPS: 90, RUNG_RESET: 120,
+          RUNG_USB: 150, RUNG_HCI: 180}
 LADDERS = {
-    'at_mute': [RUNG_RESET, RUNG_USB],
-    'sim':     [RUNG_CFUN, RUNG_RESET, RUNG_USB],
-    'reg':     [RUNG_COPS, RUNG_CFUN, RUNG_RESET, RUNG_USB],
-    'dial':    [RUNG_COPS, RUNG_CFUN, RUNG_RESET, RUNG_USB],
-    'traffic': [RUNG_CFUN],
+    'at_mute': [RUNG_RESET, RUNG_USB, RUNG_HCI],
+    'sim':     [RUNG_RESET, RUNG_USB],
+    'reg':     [RUNG_RADIO_ON, RUNG_COPS, RUNG_RESET, RUNG_USB, RUNG_HCI],
+    'dial':    [RUNG_COPS, RUNG_RESET, RUNG_USB],
+    'traffic': [RUNG_RESET],
 }
-GRACE = {'at_mute': 0, 'sim': 300, 'reg': 120, 'reg_searching': 300, 'dial': 0, 'traffic': 0}
+RESET_MIN_GAP = 600         # never two modem resets within 10 minutes
+
+# Returned by the detector when the modem told us nothing this poll: neither
+# "a fault" nor "no fault".
+UNKNOWN = object()
+# 'traffic' is the only reason that can fire on a link which is otherwise
+# perfectly healthy (an operator filtering ICMP looks exactly like a dead
+# session), so it gets a long grace period and the mildest possible ladder.
+GRACE = {'at_mute': 0, 'sim': 300, 'reg': 120, 'reg_searching': 300,
+         'dial': 0, 'traffic': 1800}
 
 log = logging.getLogger()
 rlog = logging.getLogger('recovery')
@@ -294,6 +320,17 @@ class SystemShim:
                 return f.read()
         except Exception:
             return None
+
+    def write(self, path, text):
+        """Plain write, for sysfs attributes. write_atomic() uses os.replace()
+        and therefore cannot write them at all."""
+        try:
+            with open(path, 'w') as f:
+                f.write(text)
+            return True
+        except Exception as e:
+            log.warning('cannot write %s: %s', path, e)
+            return False
 
     def write_atomic(self, path, text):
         tmp = path + '.tmp'
@@ -479,8 +516,11 @@ class E3372Modem:
                 time.sleep(0.3)
 
                 lines = []
-                end_time = time.time() + timeout
-                while time.time() < end_time:
+                # Monotonic: this GX has no NTP and its wall clock is hours
+                # off, so a step of the wall clock must never turn a 3 s
+                # timeout into an infinite wait (or an instant one).
+                end_time = time.monotonic() + timeout
+                while time.monotonic() < end_time:
                     if self.stop_event.is_set():
                         self.last_error = 'io'
                         return None
@@ -569,6 +609,11 @@ class Recovery:
             'busy_until': self.busy_until, 'next_ladder_at': self.next_ladder_at,
             'ladder_count': self.ladder_count, 'ladder_started_at': self.ladder_started_at,
             'history': self.history[-20:],
+            # The devnum recorded before the current destructive rung: the
+            # rung usually kills this service, so the next instance needs it
+            # to judge whether the modem really re-enumerated.
+            'reset_devnum': getattr(self.actions, 'reset_devnum', None),
+            'last_reset_at': getattr(self.actions, 'last_reset_at', None),
         }
         self.sysx.write_atomic(STATE_FILE, json.dumps(data))
 
@@ -596,6 +641,10 @@ class Recovery:
         self.ladder_count = data.get('ladder_count', 0)
         self.ladder_started_at = data.get('ladder_started_at')
         self.history = data.get('history', [])
+        if data.get('reset_devnum') is not None:
+            self.actions.reset_devnum = data['reset_devnum']
+        if data.get('last_reset_at') is not None:
+            self.actions.last_reset_at = data['last_reset_at']
         if self.state == 'rung' and (self.reason not in LADDERS
                                      or self.rung_idx >= len(LADDERS[self.reason])):
             self.state = 'idle'
@@ -614,7 +663,11 @@ class Recovery:
         if self.mute_polls >= AT_MUTE_POLLS:
             return 'at_mute'
         if not snap.get('at_alive'):
-            return None
+            # The modem said nothing this poll: that is not evidence the fault
+            # has cleared. Returning None here used to wipe the reason and
+            # restart the grace timer, so an intermittently silent modem could
+            # never reach the ladder at all.
+            return UNKNOWN
         sim = snap.get('sim')
         if sim in SIM_LADDER:
             return 'sim'
@@ -661,6 +714,10 @@ class Recovery:
             return
         self.mute_polls = 0 if snap.get('at_alive') else self.mute_polls + 1
         r = self._reason_of(snap)
+        if r is UNKNOWN:
+            # Keep stuck_since, seen and the current reason untouched; only
+            # mute_polls keeps counting, towards the at_mute reason.
+            return
         if r is None:
             self.seen.clear()
         else:
@@ -757,7 +814,20 @@ class Recovery:
             elif self.phase == 'next':
                 self._advance_rung(now)
             else:  # settle over: verify, then judge
-                if self.reason == 'dial' and not self.verify_started:
+                ladder = self._ladder()
+                rung = ladder[self.rung_idx] if 0 <= self.rung_idx < len(ladder) else None
+                # A rung that answered OK but provably changed nothing (the
+                # modem never left the bus) must not burn the rest of the
+                # settle: escalate straight away.
+                if rung and not self.verify_started                         and not self.actions.rung_was_effective(rung):
+                    if self.history:
+                        self.history[-1]['result'] = 'ineffective'
+                    self._advance_rung(now)
+                    return
+                # Both 'dial' and 'traffic' are judged on a session that the
+                # rung has just torn down, so they need a dial before the
+                # verdict - otherwise they can never be scored a success.
+                if self.reason in ('dial', 'traffic') and not self.verify_started:
                     if self.actions.verify_dial(now):
                         self.verify_started = True
                         self.busy_until = now + VERIFY_WINDOW
@@ -775,7 +845,7 @@ class Recovery:
     def _destructive_recent(self, now):
         return sum(1 for h in self.history
                    if h.get('rung') in RUNG_DESTRUCTIVE and h.get('result') == 'sent'
-                   and now - h.get('t', 0) < DESTRUCTIVE_WINDOW)
+                   and now - h.get('t', 0) < DESTRUCTIVE_WINDOW * self.ts)
 
     def _start_ladder(self, now):
         self.state = 'rung'
@@ -786,9 +856,32 @@ class Recovery:
                      fmt_duration(now - (self.stuck_since or now)), self.level)
         self._advance_rung(now)
 
+    def _destructive_free_at(self, now):
+        """When the destructive budget frees up, or None if it is free now."""
+        stamps = sorted(h.get('t', 0) for h in self.history
+                        if h.get('rung') in RUNG_DESTRUCTIVE and h.get('result') == 'sent'
+                        and now - h.get('t', 0) < DESTRUCTIVE_WINDOW * self.ts)
+        if len(stamps) < DESTRUCTIVE_MAX:
+            return None
+        return stamps[-DESTRUCTIVE_MAX] + DESTRUCTIVE_WINDOW * self.ts
+
+    def _defer_ladder(self, now, until):
+        """Postpone a ladder whose every rung is currently blocked by the
+        destructive budget, WITHOUT counting it: counting it would double the
+        backoff for a ladder that never ran a single command."""
+        self.next_ladder_at = until
+        self.state = 'wait'
+        self.last_nag = now
+        self.rung_idx = -1
+        rlog.warning('recovery: [%s] ladder #%d deferred, every rung is held by '
+                     'the reset budget; retrying in %s', self.reason,
+                     self.ladder_count + 1, fmt_duration(until - now))
+        self.save(now)
+
     def _advance_rung(self, now):
         ladder = self._ladder()
         idx = self.rung_idx + 1
+        held_until = None
         while idx < len(ladder):
             rung = ladder[idx]
             if RUNG_MIN_LEVEL[rung] > self.level:
@@ -797,13 +890,20 @@ class Recovery:
                 idx += 1
                 continue
             if rung in RUNG_DESTRUCTIVE and self._destructive_recent(now) >= DESTRUCTIVE_MAX:
-                rlog.error('recovery: [%s] rung %d/%d %s refused: %d destructive resets '
-                           'in the last %s', self.reason, idx + 1, len(ladder), rung,
-                           DESTRUCTIVE_MAX, fmt_duration(DESTRUCTIVE_WINDOW))
+                free_at = self._destructive_free_at(now)
+                if free_at is not None:
+                    held_until = free_at if held_until is None else min(held_until, free_at)
+                rlog.error('recovery: [%s] rung %d/%d %s held: %d resets in the last %s',
+                           self.reason, idx + 1, len(ladder), rung,
+                           DESTRUCTIVE_MAX, fmt_duration(DESTRUCTIVE_WINDOW * self.ts))
                 idx += 1
                 continue
             break
         if idx >= len(ladder):
+            if held_until is not None and self.rung_idx < 0:
+                # Nothing ran at all, only the budget stood in the way.
+                self._defer_ladder(now, held_until)
+                return
             self._finish_ladder(now, False)
             return
         self.rung_idx = idx
@@ -813,47 +913,45 @@ class Recovery:
         self._run_step(now)
 
     def _run_step(self, now):
+        """Execute the current rung. Every rung is a single command, so there
+        is no half-finished sequence to recover from."""
         ladder = self._ladder()
         rung = ladder[self.rung_idx]
-        nsteps = RUNG_STEPS[rung]
         destructive = rung in RUNG_DESTRUCTIVE
         if destructive:
-            # The service may not survive this command: persist first, so that
-            # the next instance waits out the settle time instead of acting.
-            self.step = nsteps
+            # The service may not survive this command (the modem leaves the
+            # bus and serial-starter kills us): take the measurement the next
+            # instance will need, then persist, then act.
+            self.actions.prepare_rung(rung, now)
             self.phase = 'settle'
             self.busy_until = now + SETTLE[rung] * self.ts
-            self.history.append({'t': now, 'reason': self.reason, 'rung': rung, 'result': 'sent'})
+            self.history.append({'t': now, 'reason': self.reason,
+                                 'rung': rung, 'result': 'sent'})
             self.save(now)
-        result = self.actions.run_rung_step(rung, self.step if not destructive else 0, now)
-        rlog.warning('recovery: [%s] ladder #%d rung %d/%d %s step %d -> %s',
-                     self.reason, self.ladder_count + 1, self.rung_idx + 1, len(ladder),
-                     rung, (self.step if not destructive else 0) + 1, result)
-        if result != 'sent' and not destructive and self.step + 1 < nsteps                 and (rung, self.step) in RUNG_BEST_EFFORT:
-            rlog.info('recovery: [%s] step %d of %s is optional, carrying on',
-                      self.reason, self.step + 1, rung)
-            result = 'sent'
+
+        result = self.actions.run_rung_step(rung, 0, now)
+        rlog.warning('recovery: [%s] ladder #%d rung %d/%d %s -> %s',
+                     self.reason, self.ladder_count + 1, self.rung_idx + 1,
+                     len(ladder), rung, result)
+
         if result == 'sent':
-            if destructive:
-                return
-            self.step += 1
-            if self.step < nsteps:
-                self.phase = 'step'
-                self.busy_until = now + STEP_GAP
-            else:
+            if not destructive:
                 self.phase = 'settle'
                 self.busy_until = now + SETTLE[rung] * self.ts
-                self.history.append({'t': now, 'reason': self.reason, 'rung': rung, 'result': 'sent'})
+                self.history.append({'t': now, 'reason': self.reason,
+                                     'rung': rung, 'result': 'sent'})
             return
-        # refused / impossible: next rung at the next poll
+
+        # refused / impossible / ineffective: go to the next rung without
+        # burning the settle time.
         if destructive:
             self.history[-1]['result'] = result
+            self.save(now)
         else:
-            self.history.append({'t': now, 'reason': self.reason, 'rung': rung, 'result': result})
+            self.history.append({'t': now, 'reason': self.reason,
+                                 'rung': rung, 'result': result})
         self.phase = 'next'
         self.busy_until = now + STEP_GAP
-        if destructive:
-            self.save(now)
 
     def _finish_ladder(self, now, success):
         ladder = self._ladder()
@@ -947,11 +1045,18 @@ class ModemService:
         self.probe_failures = 0
         self.probe_redials = 0
         self.probe_exhausted = False
+        self.probe_runs = 0
+        self.probe_runs_at_redial = 0
+        self.last_rx = None
         self.probe_suspended_until = 0.0
         self.last_probe = 0.0
         self.probe_thread = None
         # SIM PIN
         self.pin_attempted = False
+        # recovery bookkeeping
+        self.reset_devnum = None
+        self.last_reset_at = -1e9
+        self.cfun = None
         # logging
         self.signal = {}
         self.last_signal_log = 0.0
@@ -973,7 +1078,7 @@ class ModemService:
                             ('/RegStatus', None), ('/PPPStatus', 0),
                             ('/Recovery/State', 'idle'), ('/Recovery/Reason', ''),
                             ('/Recovery/Rung', ''), ('/Recovery/LadderCount', 0),
-                            ('/Recovery/NextLadderIn', 0),
+                            ('/Recovery/NextLadderIn', 0), ('/Modem/Cfun', None),
                             ('/Signal/Rsrp', None), ('/Signal/Sinr', None), ('/Signal/Rsrq', None)):
             self.dbus.add_path(path, value)
 
@@ -996,6 +1101,7 @@ class ModemService:
                                        self.setting_changed, timeout=10)
 
         self.recovery.load(time.monotonic())
+        self._repair_usb_intent()
         self._ensure_linkwatch()
 
         if not self.modem.open():
@@ -1329,6 +1435,17 @@ class ModemService:
             self.signal = {}
             return
 
+        # Radio state. The package never switches the radio off, but something
+        # else might have (a manual command, a firmware quirk), and until v1.4
+        # the service had no way to see it at all.
+        cfun = self._query_cfun()
+        if cfun is not None and cfun != self.cfun:
+            rlog.warning('radio: CFUN %s -> %s', self.cfun, cfun)
+            self.cfun = cfun
+        self.dbus['/Modem/Cfun'] = self.cfun
+        if not self.modem.responded():
+            return
+
         # Signal strength
         r = self.modem.at('AT+CSQ')
         if not self.modem.responded():
@@ -1427,6 +1544,7 @@ class ModemService:
             'probe_exhausted': self.probe_exhausted,
             'connect_wanted': self._connect_wanted(),
             'roaming_allowed': self._roaming_allowed(),
+            'cfun': self.cfun,
         }
 
     # ---- session watchdog ----------------------------------------------------
@@ -1436,13 +1554,33 @@ class ModemService:
         self.next_redial = 0.0
         self.probe_failures = 0
 
+    def _rx_bytes(self):
+        v = (self.sysx.read('/sys/class/net/%s/statistics/rx_bytes' % IFACE) or '').strip()
+        try:
+            return int(v)
+        except ValueError:
+            return None
+
     def _probe(self):
-        """Verify traffic actually flows. Runs in a worker thread."""
+        """Verify traffic actually flows. Runs in a worker thread.
+
+        A ping that goes unanswered is NOT proof of a dead session: plenty of
+        APNs filter ICMP. Received bytes moving on the interface is proof of
+        the opposite, and on this install Tailscale keepalives guarantee they
+        move on a live link - so that reading overrides a failed ping.
+        """
         ok = False
         for host in self.cfg.probe_hosts:
             if self.sysx.ping(host, IFACE):
                 ok = True
                 break
+        rx = self._rx_bytes()
+        if not ok and rx is not None and self.last_rx is not None and rx > self.last_rx:
+            log.info('connectivity probe: no ping answer but %d bytes came in, '
+                     'the link is alive', rx - self.last_rx)
+            ok = True
+        self.last_rx = rx
+        self.probe_runs += 1
         if ok:
             if self.probe_failures:
                 log.info('connectivity probe recovered')
@@ -1546,20 +1684,35 @@ class ModemService:
             return
 
         if self.probe_redials >= PROBE_REDIALS_MAX:
-            # Re-dialling does not help: hand over to the recovery ladder.
-            self.probe_exhausted = True
+            # Re-dialling does not help: hand over to the recovery ladder, but
+            # only once a probe has actually completed on the session the last
+            # re-dial created - otherwise the verdict is about the old one.
+            if self.probe_runs > self.probe_runs_at_redial:
+                self.probe_exhausted = True
             return
 
         before = self.next_redial
         self._maybe_redial('no connectivity after %d probes' % self.probe_failures, now)
         if self.next_redial != before:
             self.probe_redials += 1
+            self.probe_runs_at_redial = self.probe_runs
+            # Measure the new session, not the old one.
+            self.last_probe = now - PROBE_INTERVAL + 30
 
     # ---- recovery actions (called by Recovery) -------------------------------
 
     def _heavy_at(self, cmd):
         """Send a slow or disruptive command, preferably on the wdm channel.
-        Returns 'sent', 'refused' or 'impossible'."""
+        Returns 'sent', 'refused' or 'impossible'.
+
+        This is the single choke point for every command the recovery ladder
+        issues, and it refuses outright anything that could leave the modem in
+        a state it cannot be commanded out of.
+        """
+        if cmd.startswith(FORBIDDEN_PREFIXES):
+            log.critical('refusing to send %s: this command can strand the '
+                         'modem (see FORBIDDEN_PREFIXES)', cmd)
+            return 'impossible'
         if self.wdm.available():
             status, text = self.wdm.send(cmd, timeout=3)
             if status in ('ok', 'timeout'):
@@ -1581,6 +1734,42 @@ class ModemService:
         if err in ('io', 'nodev'):
             return 'impossible'
         return 'refused'
+
+    def _repair_usb_intent(self):
+        """Undo a USB action that was interrupted half-way.
+
+        The helper disables the modem's port, then re-enables it five seconds
+        later. If it is killed in between (OOM, a reboot of the service, a
+        stray kill), the port stays down and nothing on this machine would
+        ever bring it back. The helper writes its intent before acting; this
+        runs at every start-up, and the linkwatch runs it every minute.
+        """
+        text = self.sysx.read(INTENT_FILE)
+        if not text:
+            return
+        try:
+            intent = json.loads(text)
+        except ValueError:
+            self.sysx.remove(INTENT_FILE)
+            return
+        if intent.get('boot_id') != self.sysx.boot_id():
+            self.sysx.remove(INTENT_FILE)
+            return
+        target = intent.get('target')
+        undo_file = intent.get('undo_file')
+        undo_value = intent.get('undo_value')
+        if not target or not undo_file:
+            self.sysx.remove(INTENT_FILE)
+            return
+        log.critical('a USB action was left unfinished (%s), undoing it: %s/%s=%s',
+                     intent.get('action'), target, undo_file, undo_value)
+        self.sysx.write(posixpath.join(target, undo_file),
+                        '%s\n' % undo_value)
+        peer = intent.get('peer')
+        if peer:
+            self.sysx.write(posixpath.join(peer, undo_file),
+                            '%s\n' % undo_value)
+        self.sysx.remove(INTENT_FILE)
 
     def _ensure_linkwatch(self):
         """Start the last-resort link watchdog, detached.
@@ -1631,19 +1820,78 @@ class ModemService:
                 return d
         return None
 
+    def _devnum(self):
+        """USB device number of the modem, which changes on every real
+        re-enumeration. This is how we tell a reset that happened from a
+        command that merely answered OK."""
+        path = self._usb_sysfs_path()
+        if not path:
+            return None
+        v = (self.sysx.read(posixpath.join(path, 'devnum')) or '').strip()
+        return v or None
+
+    def _usb_controller(self, path):
+        """Platform name of the USB controller carrying the modem, e.g.
+        'xhci-hcd.1'. Never guess: rebinding the wrong controller would take
+        out the VE.Direct adapters and the GPS."""
+        if not path:
+            return None
+        real = self.sysx.realpath(path)
+        for part in real.split('/'):
+            if part.startswith('xhci-hcd.') or part.startswith('dwc'):
+                return part
+        return None
+
+    def _query_cfun(self):
+        """Current AT+CFUN? value, or None when unknown."""
+        r = self.modem.at('AT+CFUN?')
+        if not r:
+            status, text = self.wdm.send('AT+CFUN?', timeout=3)
+            if status != 'ok':
+                return None
+            r = text.splitlines()
+        for line in r:
+            if '+CFUN:' in line:
+                try:
+                    return int(line.split(':', 1)[1].strip().split(',')[0])
+                except ValueError:
+                    return None
+        return None
+
+    def prepare_rung(self, rung, now):
+        """Called just before a destructive rung is persisted and executed.
+        Records what the next instance of this service will need to judge the
+        rung, since the rung itself usually kills us."""
+        self.reset_devnum = self._devnum()
+
     def run_rung_step(self, rung, step, now):
-        if rung == RUNG_COPS:
-            return self._heavy_at('AT+COPS=2' if step == 0 else 'AT+COPS=0')
-        if rung == RUNG_CFUN:
-            if step == 0:
-                self.pin_attempted = False
-                self._cancel_dial()
-                return self._heavy_at('AT+CFUN=0')
+        if rung == RUNG_RADIO_ON:
+            # Only ever switches the radio ON, and only when it is off. The
+            # package has no command that switches it off.
+            cfun = self._query_cfun()
+            if cfun == 1:
+                rlog.info('recovery: radio already on (CFUN 1), nothing to do')
+                return 'ineffective'
+            if cfun is None:
+                return 'impossible'
+            rlog.warning('recovery: radio is off (CFUN %s), switching it on', cfun)
             return self._heavy_at('AT+CFUN=1')
+
+        if rung == RUNG_COPS:
+            return self._heavy_at('AT+COPS=0')
+
         if rung == RUNG_RESET:
+            if now - self.last_reset_at < RESET_MIN_GAP * self.cfg.timescale:
+                rlog.warning('recovery: modem reset refused, last one was %s ago',
+                             fmt_duration(now - self.last_reset_at))
+                return 'refused'
             self.pin_attempted = False
             self._cancel_dial()
-            return self._heavy_at('AT+CFUN=1,1')
+            self.last_reset_at = now
+            # AT^RESET is the only command measured to actually restart this
+            # firmware: AT+CFUN=1,1 answers OK without ever leaving the bus.
+            return self._heavy_at('AT^RESET')
+
         if rung == RUNG_USB:
             path = self._usb_sysfs_path()
             if not path:
@@ -1653,8 +1901,47 @@ class ModemService:
             self._cancel_dial()
             self._stop_dhcp()
             self.modem.close()
-            return 'sent' if self.sysx.spawn_detached([USB_RESET_HELPER, path]) else 'impossible'
+            return 'sent' if self.sysx.spawn_detached(
+                [USB_RESET_HELPER, 'portcycle', path]) else 'impossible'
+
+        if rung == RUNG_HCI:
+            path = self._usb_sysfs_path()
+            hci = self._usb_controller(path)
+            if not hci:
+                rlog.error('recovery: cannot work out the modem USB controller')
+                return 'impossible'
+            self.pin_attempted = False
+            self._cancel_dial()
+            self._stop_dhcp()
+            self.modem.close()
+            return 'sent' if self.sysx.spawn_detached(
+                [USB_RESET_HELPER, 'rebind', path, hci]) else 'impossible'
+
         return 'impossible'
+
+    def rung_was_effective(self, rung):
+        """Called at the end of a destructive rung's settle time: did the modem
+        really re-enumerate? AT^RESET and the USB actions must change devnum;
+        a command that merely answered OK did nothing, and the ladder must move
+        on instead of waiting out the rest of the settle.
+        """
+        if rung not in (RUNG_RESET, RUNG_USB, RUNG_HCI):
+            return True
+        if self.reset_devnum is None:
+            return True
+        now_devnum = self._devnum()
+        if now_devnum is None:
+            # The device is not on the bus (yet): that is a re-enumeration in
+            # progress, not an ineffective rung.
+            return True
+        if now_devnum == self.reset_devnum:
+            rlog.error('recovery: %s left devnum at %s - the modem never left '
+                       'the bus, treating the rung as ineffective',
+                       rung, now_devnum)
+            return False
+        rlog.info('recovery: %s re-enumerated the modem (devnum %s -> %s)',
+                  rung, self.reset_devnum, now_devnum)
+        return True
 
     def on_stuck(self, reason, snap):
         if reason != 'at_mute':
@@ -1677,12 +1964,20 @@ class ModemService:
         """Synchronous probe, used once at the end of the traffic ladder."""
         if not self.cfg.probe_hosts:
             return True
+        ok = False
         for host in self.cfg.probe_hosts:
             if self.sysx.ping(host, IFACE):
-                self.probe_failures = 0
-                self.probe_redials = 0
-                self.probe_exhausted = False
-                return True
+                ok = True
+                break
+        rx = self._rx_bytes()
+        if not ok and rx is not None and self.last_rx is not None and rx > self.last_rx:
+            ok = True
+        self.last_rx = rx
+        if ok:
+            self.probe_failures = 0
+            self.probe_redials = 0
+            self.probe_exhausted = False
+            return True
         return False
 
     def on_traffic_exhausted(self, now):

@@ -1,3 +1,67 @@
+v1.4
+    Measured on the hardware on 2026-09-22, and it changes the design:
+      - AT^RESET is the ONLY command that restarts this firmware, and the
+        only one that escapes the state a radio-off leaves it in. Proven:
+        with the radio off, AT+CFUN=1 and AT+COPS=0 both answer
+        +CME ERROR: 100; AT^RESET answers OK, the device leaves the bus for
+        2.7 s and comes back registered 10 s later.
+      - AT+CFUN=1,1 restarts NOTHING. It answers OK and the device never
+        leaves the bus. v1.3 used it as its "modem reset" rung.
+      - No host-side USB action changes anything inside the modem. The port
+        really loses power on paper, and the modem still comes back 0.5 s
+        later with its firmware state intact. De-authorising, disabling the
+        port and rebinding the controller are three strengths of the same
+        bus reset, useful only when the driver is wedged.
+    New ladder, every rung a single command (so the service can never be
+        killed between two halves of a sequence): radio on if it is off,
+        automatic operator selection, AT^RESET, USB re-enumeration,
+        controller rebind. RECOVERY_LEVEL now means 0 observe, 1 safe AT,
+        2 + modem reset, 3 + USB, 4 + controller.
+    New: commands that can strand the modem are refused at a single choke
+        point (AT+CFUN=0/4/6/7, AT+COPS=2, AT+CGATT=0). The package can no
+        longer create a state it may be unable to leave - which is what the
+        v1.3 radio cycle risked doing every time it ran.
+    New: a destructive rung is only credited when the modem really
+        re-enumerated (its USB devnum changed), recorded before the rung and
+        persisted, since the rung itself usually kills this service. A rung
+        that answered OK and changed nothing escalates immediately instead
+        of burning its settle time.
+    New: the USB helper writes its intent to /run before acting, guarded by
+        a trap, a forked child and a repair pass run by the service at
+        start-up and by the link watchdog every minute. A helper killed
+        between its two writes can no longer leave the port down.
+    New: the link watchdog talks to the modem FIRST (AT+CFUN? then
+        AT^RESET) and only then touches USB, escalating to the port cycle
+        and finally to the controller rebind, sharing a destructive budget
+        with the service's ladder and never rebooting the GX.
+    Fix: a silent AT poll no longer wipes the current reason and restarts
+        the grace timer, so an intermittently mute modem now reaches the
+        ladder.
+    Fix: a ladder whose every rung is held by the reset budget is deferred,
+        not counted, so it no longer doubles the backoff for a ladder that
+        never ran a command.
+    Fix: the traffic reason waits 30 min instead of 6, uses the interface's
+        received-byte counter to overrule a failed ping (an APN that filters
+        ICMP no longer costs the modem a restart), and its verdict is taken
+        on the session the last re-dial created.
+    Fix: AT timeouts are measured on the monotonic clock. This GX has no NTP
+        and its wall clock is hours off, so a clock step could turn a 3 s
+        timeout into an unbounded wait.
+    Fix: the link watchdog no longer sources the user-editable config (a
+        stray CR disarmed it, and a syntax error would have executed), and
+        no longer rebinds every USB controller - only the modem's own.
+    Fix: SystemShim.write() added for sysfs, which os.replace() cannot
+        touch; every repair path depended on it.
+    New: /Modem/Cfun on D-Bus, and the radio state is read at every poll -
+        v1.3 had no way to see that the radio was off at all.
+    New: e3372_at.py shipped with the package. A shell redirection to
+        /dev/cdc-wdm0 silently does nothing, which cost a misleading test;
+        the ReadMe recommended it.
+    Tests: 67 offline scenarios plus a shell bench that runs the real
+        helpers against a fake sysfs tree. The fake modem now models the
+        measured truth: AT^RESET restarts, AT+CFUN=1,1 does not, a bus reset
+        preserves the firmware state, and a radio-off refuses every write.
+
 v1.3
     New: last-resort link watchdog (/data/e3372_linkwatch.sh), started
         detached by the service so that it survives the service being

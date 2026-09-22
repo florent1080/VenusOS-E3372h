@@ -38,58 +38,85 @@ Configuration:
 Edit /data/e3372-config.conf:
   APN=your.operator.apn
   PROBE_HOST=8.8.8.8,1.1.1.1   (comma-separated, empty to disable the check)
-  RECOVERY_LEVEL=4             (0 to 4, see below)
-  LINKWATCH=1                  (last-resort USB port reset, see below)
-  LINKWATCH_DOWN_SECONDS=900   (how long the link must be dead first)
+  RECOVERY_LEVEL=4             (0 observe, 1 safe AT, 2 reset, 3 USB, 4 controller)
+  LINKWATCH=1                  (last-resort watchdog, see below)
+  LINKWATCH_DOWN_SECONDS=600   (how long the link must be dead first)
+  LINKWATCH_HCI_RESET=1        (allow the controller rebind as a last step)
   RECOVERY_TIMESCALE=1.0       (tests only: shortens every recovery delay)
 
 PROBE_HOST hosts are pinged every 2 minutes through wwan0; the check passes
 when any of them answers. After 3 consecutive failures the watchdog re-dials
 the session, which covers the case where the modem still reports the session
 as up but no traffic gets through. When three re-dials do not help, the
-recovery ladder cycles the radio once, then suspends the check for 6 hours.
+recovery ladder waits a further 30 minutes, resets the modem once, then
+suspends the check for 6 hours. Received bytes on wwan0 overrule a failed
+ping, so an APN that filters ICMP never costs the modem a restart.
 Set PROBE_HOST= (empty) if your operator or APN filters ICMP, otherwise the
 watchdog will re-dial for nothing.
 
 Recovery ladder:
 The session watchdog only works while the modem is registered on a network.
 Every other state is handled by the recovery ladder, which detects the
-condition, waits a grace period, then escalates rung by rung until the
-condition clears:
+condition, waits a grace period, then escalates one rung at a time until the
+condition clears. Every rung is a single command, so the service can never be
+killed half-way through a sequence.
 
   condition                         grace    rungs
-  AT port mute or gone              60s      modem reset, USB reset
-  SIM missing / failed / busy       5min     radio cycle, modem reset, USB reset
-  not registered / denied / unknown 2min     re-selection, radio cycle, modem reset, USB reset
+  AT port mute or gone              60s      reset, USB, controller
+  SIM missing / failed / busy       5min     reset, USB
+  not registered / denied / unknown 2min     radio on, operator, reset, USB, controller
   searching for a network           5min     same
-  registered but dial keeps failing -        same
-  session up but no traffic         -        radio cycle, then probe suspended 6h
+  registered but dial keeps failing -        operator, reset, USB
+  session up but no traffic         30min    reset
 
-  rung            command                          RECOVERY_LEVEL
-  re-selection    AT+COPS=2 then AT+COPS=0         1
-  radio cycle     AT+CFUN=0 then AT+CFUN=1         2
-  modem reset     AT+CFUN=1,1 (USB re-enumerates)  3
-  USB reset       /data/e3372_usb_reset.sh         4
+  rung          command                       RECOVERY_LEVEL
+  radio on      AT+CFUN=1, only if it is off  1
+  operator      AT+COPS=0                     1
+  modem reset   AT^RESET                      2
+  USB reenum    port disable/enable           3
+  controller    unbind/bind of its xhci-hcd   4
+
+What the hardware actually does, measured on 2026-09-22 (Pi 5, E3372h
+firmware 21.180) - the whole design rests on these three facts:
+  - AT^RESET is the only command that restarts this firmware. With the
+    radio off it answers OK while AT+CFUN=1 and AT+COPS=0 are both refused
+    with +CME ERROR: 100; the device leaves the bus for 2.7 s and comes back
+    registered 10 s later.
+  - AT+CFUN=1,1 restarts nothing. It answers OK and the device never leaves
+    the bus. It is not used anywhere in this package.
+  - No host-side USB action changes anything inside the modem. The port
+    really loses power on paper and the modem still comes back 0.5 s later
+    with its firmware state intact. The USB rungs are bus resets: the right
+    tool for a wedged driver, useless against a wedged modem.
+
+The package never switches the radio off, never deregisters and never
+detaches. AT+CFUN=0/4/6/7, AT+COPS=2 and AT+CGATT=0 are refused at a single
+choke point in the code: a modem that will not come back out of such a state
+can only be recovered by someone walking to the van.
+
+A destructive rung is credited only when the modem really re-enumerated (its
+USB device number changed). A rung that answered OK and changed nothing
+escalates immediately instead of waiting out its settle time.
 
 Every rung needs the modem's tty (or /dev/cdc-wdm0). Both vanish when the
 modem leaves the USB bus, and serial-starter then kills the service - so the
-package also installs a last-resort link watchdog, /data/e3372_linkwatch.sh,
-which the service starts detached so that it outlives it. It does one thing:
-reset the modem's USB port once wwan0 has had no address and no default route
-for LINKWATCH_DOWN_SECONDS (15 min by default), at most once every 30 minutes,
-and never while the data session is alive. Its log is
-/data/log/e3372/linkwatch.log.
+package also installs /data/e3372_linkwatch.sh, which the service starts
+detached so that it outlives it. It repairs a USB action that was interrupted
+half-way (the helper records its intent in /run before acting), and if the
+link stays down it escalates on its own: AT^RESET, then a USB re-enumeration,
+then the controller rebind, sharing a destructive budget with the service.
+Its log is /data/log/e3372/linkwatch.log.
 
 A PIN or PUK request, a wrong SIM, or roaming while roaming is not permitted
 are reported but never acted upon. When a whole ladder fails, the next one
 waits 15 minutes, then 30, 1 hour, 2 hours, up to 4 hours, forever: the
-watchdog never gives up and never reboots the GX. No more than two modem or
-USB resets are ever issued within 30 minutes. RECOVERY_LEVEL=0 keeps the
-detection and the logs but takes no action.
+watchdog never gives up and never reboots the GX. No more than three
+destructive rungs run within 30 minutes. RECOVERY_LEVEL=0 keeps the detection
+and the logs but takes no action.
 
-The modem reset and the USB reset make the modem re-enumerate: the service
-is stopped by serial-starter and restarted on the new tty. The ladder state
-is kept in /run/e3372-recovery.json across that restart.
+The modem reset and the USB rungs make the modem re-enumerate: the service is
+stopped by serial-starter and restarted on the new tty. The ladder state is
+kept in /run/e3372-recovery.json across that restart.
 
 Troubleshooting:
 - Service log:  tail -f /var/log/dbus-modem.ttyUSB*/current
@@ -99,6 +126,8 @@ Troubleshooting:
   Lines are prefixed recovery:, session:, reg:, sim: and signal:.
 - Link log:     tail -f /var/log/e3372.log
 - Ladder state: dbus -y com.victronenergy.modem /Recovery/State GetValue
+- Radio state: dbus -y com.victronenergy.modem /Modem/Cfun GetValue  (1 = on)
+- USB helper log: /data/log/e3372/usbreset.log
 - Ask the modem directly, without disturbing the service (it owns the
   serial port; /dev/cdc-wdm0 is a second, independent AT channel):
     /data/e3372_at.py 'AT^NDISSTATQRY?' 'AT+CREG?' 'AT^HCSQ?'
@@ -119,6 +148,8 @@ Tests:
 tests/ holds an offline bench (Python unittest, no hardware, no Venus
 libraries needed) that drives the service against a scripted fake modem:
   python -m unittest discover -s tests -v
+and a shell bench that runs the real helpers against a fake sysfs tree:
+  sh tests/linkwatch_bench.sh
 
 Tested on:
 - Raspberry Pi 5 with Venus OS v3.75 (Bouygues Telecom, APN mmsbouygtel.com)
