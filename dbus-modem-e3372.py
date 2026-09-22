@@ -69,6 +69,7 @@ DIAL_FAILURES_MAX = 5       # consecutive dial failures before the recovery ladd
 SESSION_STABLE = 60         # seconds of stable session before the backoff is reset
 DHCP_STALE = 60             # seconds without address on a live session before DHCP restart
 DHCP_RESTART_MIN_GAP = 120  # never restart DHCP more often than this
+DHCP_START_GRACE = 15       # let a freshly started udhcpc write its pidfile
 AT_MUTE_POLLS = 6           # consecutive polls without any AT answer = mute port
 SIGNAL_LOG_INTERVAL = 60    # seconds between periodic signal quality lines
 NAG_INTERVAL = 600          # seconds between repeats of a standing warning
@@ -1041,6 +1042,7 @@ class ModemService:
         self.session_up_at = None
         self.no_ip_since = None
         self.last_dhcp_restart = 0.0
+        self.dhcp_started_at = -1e9
         # probe state
         self.probe_failures = 0
         self.probe_redials = 0
@@ -1289,9 +1291,18 @@ class ModemService:
             return pid
         return None
 
-    def _ensure_dhcp(self):
+    def _ensure_dhcp(self, now=None):
         if self._dhcp_pid():
             return
+        # udhcpc is started in the background and writes its pidfile a moment
+        # later, so _dhcp_pid() still says "nothing running" for a second or
+        # two. Without this guard the very next poll starts a second client on
+        # the same interface, and the two fight over the lease.
+        if now is None:
+            now = time.monotonic()
+        if now - self.dhcp_started_at < DHCP_START_GRACE:
+            return
+        self.dhcp_started_at = now
         log.info('starting udhcpc on %s', IFACE)
         # No -q: udhcpc stays resident and renews the lease.
         self.sysx.sh('udhcpc -i %s -b -p %s -t 8 -T 3 -A 15 >/dev/null 2>&1 &'
@@ -1304,6 +1315,7 @@ class ModemService:
         self.sysx.remove(DHCP_PIDFILE)
 
     def _restart_dhcp(self):
+        self.dhcp_started_at = -1e9      # a deliberate restart is never held
         self._stop_dhcp()
         time.sleep(0.5)
         self.sysx.sh('ip link set %s up 2>/dev/null' % IFACE)
@@ -1674,7 +1686,7 @@ class ModemService:
                 self.last_dhcp_restart = now
                 self._restart_dhcp()
             else:
-                self._ensure_dhcp()
+                self._ensure_dhcp(now)
             return
         self.no_ip_since = None
 

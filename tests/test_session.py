@@ -78,6 +78,17 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(b.logs('re-dial backoff reset'))
         self.assertEqual(b.svc.redial_count, 0)
 
+    def test_only_one_dhcp_client_is_started_after_a_dial(self):
+        """udhcpc writes its pidfile a moment after it starts; the next poll
+        must not take that for "nothing is running" and start a second one."""
+        b = harness.Bench()
+        b.modem.dial_delay = 3
+        b.start()
+        b.run(40)
+        starts = [c for c in b.system.calls
+                  if c[1] == 'sh' and c[2].startswith('udhcpc')]
+        self.assertEqual(len(starts), 1, starts)
+
     def test_stale_dhcp_is_restarted(self):
         b = harness.Bench()
         b.modem.ndis = 1
