@@ -26,7 +26,7 @@ source "/data/SetupHelper/HelperResources/IncludeHelpers"
 # this very install whenever its command line mentions the file.
 stop_linkwatch() {
     for d in /proc/[0-9]*; do
-        tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q '^[^ ]*sh [^ ]*e3372_linkwatch\.sh $' && kill -9 "${d#/proc/}" 2>/dev/null
+        { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null | grep -q '^[^ ]*sh [^ ]*e3372_linkwatch\.sh $' && kill -9 "${d#/proc/}" 2>/dev/null
     done
     rm -f /var/run/e3372-linkwatch.pid
 }

@@ -161,7 +161,7 @@ cleanup() {
 other_instance() {
     for d in /proc/[0-9]*; do
         [ "${d#/proc/}" = "$$" ] && continue
-        tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q '^[^ ]*sh [^ ]*e3372_linkwatch\.sh $' && return 0
+        { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null | grep -q '^[^ ]*sh [^ ]*e3372_linkwatch\.sh $' && return 0
     done
     return 1
 }
