@@ -31,13 +31,28 @@ class FakeSystem:
         self.ping_results = True   # bool or callable(host) -> bool
         self.boot = 'boot-1'
         self.ip = ''
-        self.udhcpc_pid = None
+        # Live DHCP client processes. A pidfile is only a note: removing it
+        # does not stop a process, which is exactly the fiction that kept an
+        # orphan client invisible to the old bench.
+        self.dhcp_pids = set()
         self.next_pid = 1000
         self.rx_bytes = 1000
         self.port_write_fails = False
         self.live_pids = set()
         self.realpaths = {}
         self.watchdog_pids = set()      # live pids that ARE the link watchdog
+
+    @property
+    def udhcpc_pid(self):
+        """The most recently started live DHCP client, or None."""
+        return max(self.dhcp_pids) if self.dhcp_pids else None
+
+    @udhcpc_pid.setter
+    def udhcpc_pid(self, pid):
+        if pid is None:
+            self.dhcp_pids.clear()
+        else:
+            self.dhcp_pids.add(pid)
 
     def _t(self):
         return self.clock.monotonic()
@@ -46,12 +61,12 @@ class FakeSystem:
         self.calls.append((self._t(), 'sh', cmd))
         if cmd.startswith('udhcpc'):
             self.next_pid += 1
-            self.udhcpc_pid = self.next_pid
-            self.files[PIDFILE] = str(self.udhcpc_pid)
-            pid = self.udhcpc_pid
+            pid = self.next_pid
+            self.dhcp_pids.add(pid)
+            self.files[PIDFILE] = str(pid)
 
             def lease():
-                if self.udhcpc_pid == pid and self.modem.ndis:
+                if pid in self.dhcp_pids and self.modem.ndis:
                     self.ip = '10.0.0.2'
             self.clock.at(5, lease)
         elif 'addr flush' in cmd:
@@ -91,9 +106,10 @@ class FakeSystem:
     def exists(self, path):
         if path.startswith('/proc/'):
             try:
-                return int(path.split('/')[2]) in self.live_pids
+                pid = int(path.split('/')[2])
             except (IndexError, ValueError):
                 return False
+            return pid in (self.live_pids | self.dhcp_pids | self.watchdog_pids)
         if path == self.tty:
             return not self.modem.died
         if path == '/dev/cdc-wdm0':
@@ -106,6 +122,9 @@ class FakeSystem:
         return any(k.startswith(prefix) for k in self.files)
 
     def listdir(self, path):
+        if path.rstrip('/') == '/proc':
+            pids = self.live_pids | self.dhcp_pids | self.watchdog_pids
+            return sorted(str(p) for p in pids)
         prefix = path.rstrip('/') + '/'
         names = set()
         for k in self.files:
@@ -139,19 +158,16 @@ class FakeSystem:
 
     def remove(self, path):
         self.files.pop(path, None)
-        if path == PIDFILE:
-            self.udhcpc_pid = None
 
     def kill(self, pid, sig=None):
         self.calls.append((self._t(), 'kill', pid))
-        if pid == self.udhcpc_pid:
-            self.udhcpc_pid = None
+        self.dhcp_pids.discard(pid)
         return True
 
     def pid_cmdline(self, pid):
         if pid in self.watchdog_pids:
             return b'/bin/sh\x00/data/e3372_linkwatch.sh\x00'
-        if pid == self.udhcpc_pid:
+        if pid in self.dhcp_pids:
             return b'udhcpc\x00-i\x00wwan0\x00'
         return b''
 
@@ -159,6 +175,8 @@ class FakeSystem:
         self.calls.append((self._t(), 'spawn', list(argv)))
         self.spawned.append(list(argv))
         if argv and str(argv[0]).endswith('e3372_usb_reset.sh'):
+            # the helper stops every DHCP client on wwan0 before acting
+            self.dhcp_pids.clear()
             self.remove(PIDFILE)
             # MEASURED: a host-side reset re-enumerates the device but
             # leaves the firmware state (CFUN, the write lock) untouched.

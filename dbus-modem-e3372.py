@@ -70,6 +70,7 @@ SESSION_STABLE = 60         # seconds of stable session before the backoff is re
 DHCP_STALE = 60             # seconds without address on a live session before DHCP restart
 DHCP_RESTART_MIN_GAP = 120  # never restart DHCP more often than this
 DHCP_START_GRACE = 15       # let a freshly started udhcpc write its pidfile
+DHCP_AUDIT_INTERVAL = 60    # how often to check that only one DHCP client runs
 AT_MUTE_POLLS = 6           # consecutive polls without any AT answer = mute port
 SIGNAL_LOG_INTERVAL = 60    # seconds between periodic signal quality lines
 NAG_INTERVAL = 600          # seconds between repeats of a standing warning
@@ -1048,6 +1049,7 @@ class ModemService:
         self.no_ip_since = None
         self.last_dhcp_restart = 0.0
         self.dhcp_started_at = -1e9
+        self.last_dhcp_audit = -1e9
         # probe state
         self.probe_failures = 0
         self.probe_redials = 0
@@ -1286,15 +1288,58 @@ class ModemService:
 
     # ---- DHCP client ---------------------------------------------------------
 
+    def _dhcp_pids(self):
+        """Every udhcpc bound to IFACE, whatever the pidfile says.
+
+        Trusting the pidfile alone is how a DHCP client stayed alive unseen
+        for 21 hours: two were started in the same second, the second one
+        overwrote the first one's pid in the pidfile, and from then on every
+        restart killed only the pidfile's client while the orphan carried on,
+        fighting the current client over the lease through dozens of
+        re-enumerations.
+        """
+        nul = bytes([0])
+        iface = IFACE.encode()
+        pids = []
+        for name in self.sysx.listdir('/proc'):
+            if not name.isdigit():
+                continue
+            argv = self.sysx.pid_cmdline(int(name)).split(nul)
+            if not argv or not argv[0].endswith(b'udhcpc'):
+                continue
+            for i, arg in enumerate(argv[:-1]):
+                if arg == b'-i' and argv[i + 1] == iface:
+                    pids.append(int(name))
+                    break
+        return sorted(pids)
+
     def _dhcp_pid(self):
-        """PID of the udhcpc instance owning IFACE, or None."""
-        try:
-            pid = int((self.sysx.read(DHCP_PIDFILE) or '').strip())
-        except ValueError:
+        """The DHCP client owning IFACE (the pidfile's one when it is among
+        the running clients), or None."""
+        pids = self._dhcp_pids()
+        if not pids:
             return None
-        if b'udhcpc' in self.sysx.pid_cmdline(pid):
-            return pid
-        return None
+        try:
+            recorded = int((self.sysx.read(DHCP_PIDFILE) or '').strip())
+        except ValueError:
+            recorded = None
+        return recorded if recorded in pids else pids[-1]
+
+    def _reap_duplicate_dhcp(self, now):
+        """Keep exactly one DHCP client on IFACE, checked once a minute."""
+        if now - self.last_dhcp_audit < DHCP_AUDIT_INTERVAL:
+            return
+        self.last_dhcp_audit = now
+        pids = self._dhcp_pids()
+        if len(pids) < 2:
+            return
+        keep = self._dhcp_pid()
+        extra = [pid for pid in pids if pid != keep]
+        rlog.warning('session: %d DHCP clients on %s, keeping %s and stopping %s',
+                     len(pids), IFACE, keep, ' '.join(str(pid) for pid in extra))
+        for pid in extra:
+            self.sysx.kill(pid)
+        self.sysx.write_atomic(DHCP_PIDFILE, '%d' % keep)
 
     def _ensure_dhcp(self, now=None):
         if self._dhcp_pid():
@@ -1314,8 +1359,7 @@ class ModemService:
                      % (IFACE, DHCP_PIDFILE))
 
     def _stop_dhcp(self):
-        pid = self._dhcp_pid()
-        if pid:
+        for pid in self._dhcp_pids():
             self.sysx.kill(pid)
         self.sysx.remove(DHCP_PIDFILE)
 
@@ -2064,6 +2108,7 @@ class ModemService:
         self._step('status', self._update_status)
         self._step('dial', lambda: self._poll_dial(now))
         self._step('session', lambda: self._track_session(now))
+        self._step('dhcp', lambda: self._reap_duplicate_dhcp(now))
         self._step('recovery', lambda: (self.recovery.observe(self._snapshot(), now),
                                         self.recovery.tick(now)))
         if self.recovery.allows_session_watchdog(now):

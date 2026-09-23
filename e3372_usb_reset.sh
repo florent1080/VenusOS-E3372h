@@ -116,13 +116,22 @@ EOF
 
 clear_intent() { rm -f "$INTENT"; }
 
+# A udhcpc bound to wwan0, recognised from its NUL-to-space command line.
+is_wwan_dhcp() { grep -q '^[^ ]*udhcpc .*-i wwan0 '; }
+
+# Every udhcpc on wwan0, found by command line: the pidfile only names the
+# last one started, and an orphan was once found alive after 21 hours.
+wwan_dhcp_pids() {
+    for d in /proc/[0-9]*; do
+        { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null | is_wwan_dhcp && echo "${d#/proc/}"
+    done
+}
+
 stop_dhcp() {
-    # Otherwise e3372_connect.sh sees a live pidfile when the interface comes
-    # back and never restarts DHCP.
-    if [ -f "$PIDFILE" ]; then
-        kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
-        rm -f "$PIDFILE"
-    fi
+    # All of them: otherwise e3372_connect.sh sees a live client when the
+    # interface comes back and never restarts DHCP.
+    for p in $(wwan_dhcp_pids); do kill "$p" 2>/dev/null; done
+    rm -f "$PIDFILE"
 }
 
 wait_back() {

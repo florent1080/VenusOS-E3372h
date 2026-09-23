@@ -54,8 +54,14 @@ echo "$(date) - $IFACE up"
 # Start a resident DHCP client. No -q: the client must stay alive to renew the
 # lease and to restore the address and default route after a session drop.
 # Same pidfile as dbus-modem-e3372.py, so the two never start a duplicate.
-if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-    echo "$(date) - udhcpc already running (pid $(cat "$PIDFILE"))"
+# Any udhcpc already bound to the interface counts, not only the one the
+# pidfile names: two clients on one interface fight over the lease.
+running=""
+for d in /proc/[0-9]*; do
+    { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null | grep -q "^[^ ]*udhcpc .*-i $IFACE " && running="$running ${d#/proc/}"
+done
+if [ -n "$running" ]; then
+    echo "$(date) - udhcpc already running on $IFACE (pid$running)"
 else
     rm -f "$PIDFILE"
     udhcpc -i "$IFACE" -b -p "$PIDFILE" -t 8 -T 3 -A 15 > /dev/null 2>&1 &

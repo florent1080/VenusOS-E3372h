@@ -8,6 +8,9 @@
 # REAL helper and exercises its discovery against a fake controller subtree
 # made of plain directories (no symlinks, so it also runs under Git Bash).
 #
+# It also checks the DHCP client matcher and lints every shell file for the
+# editing artefacts that slipped through more than once.
+#
 # Usage: sh tests/usb_reset_bench.sh
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -93,6 +96,49 @@ if grep -q 'exit 3' "$PKG/e3372_usb_reset.sh"; then ok "a refusal exits with its
 else bad "no distinct exit status for a refusal"; fi
 if grep -q '"\$rc" = 3' "$PKG/e3372_linkwatch.sh"; then ok "the watchdog recognises a refusal"
 else bad "the watchdog does not recognise a refusal"; fi
+
+echo
+echo "== DHCP clients: every one on wwan0, and only those =="
+
+# An orphan client, whose pid had been overwritten in the pidfile, was found
+# alive after 21 hours fighting the current one over the lease. Stopping and
+# detecting clients now goes by command line, not by pidfile.
+m() { printf '%s' "$1" | is_wwan_dhcp && echo match || echo no; }
+check "the real client is recognised" \
+      "$(m 'udhcpc -i wwan0 -b -p /var/run/udhcpc.wwan0.pid -t 8 -T 3 -A 15 ')" "match"
+check "a client started by full path is recognised" "$(m '/sbin/udhcpc -i wwan0 ')" "match"
+check "a client on another interface is left alone" "$(m 'udhcpc -i wlan0 -b ')" "no"
+check "a similarly named interface is left alone" "$(m 'udhcpc -i wwan00 ')" "no"
+check "a grep that mentions it is left alone" "$(m 'grep udhcpc -i wwan0 ')" "no"
+check "a shell that mentions it is left alone" "$(m 'sh -c udhcpc -i wwan0 ; sleep 1 ')" "no"
+
+if grep -q 'udhcpc .\*-i \$IFACE ' "$PKG/e3372_connect.sh"; then
+    ok "the link bring-up looks for any client on the interface, not just the pidfile's"
+else
+    bad "the link bring-up only trusts the pidfile"
+fi
+
+echo
+echo "== editing artefacts =="
+
+# Three times in one day an edit turned a backslash-newline continuation into
+# a literal '\n' followed by indentation. The script still parses, the command
+# silently misbehaves (an extra argument, a grep that never matches). Catch
+# that shape in every shell file of the package.
+for f in "$PKG"/*.sh "$PKG/setup" "$PKG"/tests/*.sh; do
+    if grep -nE ' \\n {4,}' "$f" > /dev/null; then
+        bad "a broken line continuation in $(basename "$f"): $(grep -nE ' \\n {4,}' "$f" | head -n 1 | cut -c1-60)"
+    else
+        ok "no broken line continuation in $(basename "$f")"
+    fi
+done
+
+# Raw control characters (a CR, a NUL, a ^A where a \1 was meant) in any
+# source file of the package.
+for f in "$PKG"/*.sh "$PKG"/*.py "$PKG/setup" "$PKG"/tests/*.sh "$PKG"/tests/*.py; do
+    n=$(tr -d '\n\t' < "$f" | tr -d '\040-\176' | tr -d '\200-\377' | wc -c)
+    check "no raw control character in $(basename "$f")" "$n" "0"
+done
 
 rm -rf "$TMP"
 echo

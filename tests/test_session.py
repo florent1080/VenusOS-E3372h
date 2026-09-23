@@ -89,6 +89,37 @@ class SessionTests(unittest.TestCase):
                   if c[1] == 'sh' and c[2].startswith('udhcpc')]
         self.assertEqual(len(starts), 1, starts)
 
+    def test_an_orphan_dhcp_client_is_stopped_with_the_others(self):
+        """A client whose pid was overwritten in the pidfile ran unseen for
+        21 h on the real Pi. A restart must stop every client on the
+        interface, not only the one the pidfile names."""
+        b = harness.Bench()
+        b.modem.ndis = 1
+        b.system.ip = '10.0.0.2'
+        b.system.dhcp_pids.update({555, 999})          # 555 is the orphan
+        b.system.files['/var/run/udhcpc.wwan0.pid'] = '999'
+        b.start()
+        b.run(20)
+        b.modem.ndis = 0                               # drop -> redial -> restart
+        b.run(60)
+        killed = [c[2] for c in b.system.calls if c[1] == 'kill']
+        self.assertIn(555, killed)
+        self.assertIn(999, killed)
+        self.assertEqual(len(b.system.dhcp_pids), 1, b.system.dhcp_pids)
+
+    def test_duplicate_dhcp_clients_are_reaped_while_the_link_is_healthy(self):
+        b = harness.Bench()
+        b.modem.ndis = 1
+        b.system.ip = '10.0.0.2'
+        b.system.dhcp_pids.update({555, 999})
+        b.system.files['/var/run/udhcpc.wwan0.pid'] = '999'
+        b.start()
+        b.run(70)
+        self.assertEqual(b.system.dhcp_pids, {999})    # the pidfile's one is kept
+        self.assertTrue(b.logs('2 DHCP clients on wwan0, keeping 999 and stopping 555'))
+        self.assertEqual(b.dbus('/Connected'), 1)
+        self.assertEqual(b.modem.sent_cmds('AT^NDISDUP'), [])   # the session was left alone
+
     def test_stale_dhcp_is_restarted(self):
         b = harness.Bench()
         b.modem.ndis = 1
