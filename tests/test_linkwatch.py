@@ -24,9 +24,18 @@ class LinkwatchTests(unittest.TestCase):
         b = self._bench()
         b.system.files[PIDFILE] = '4242'
         b.system.live_pids.add(4242)
+        b.system.watchdog_pids.add(4242)
         b.start()
         self.assertNotIn([HELPER], b.system.spawned)
         self.assertTrue(b.logs('linkwatch already running (pid 4242)'))
+
+    def test_started_when_the_pid_now_belongs_to_something_else(self):
+        # pids are reused: a live pid in a stale pidfile is not proof
+        b = self._bench()
+        b.system.files[PIDFILE] = '4242'
+        b.system.live_pids.add(4242)            # alive, but not a watchdog
+        b.start()
+        self.assertIn([HELPER], b.system.spawned)
 
     def test_restarted_when_the_recorded_process_is_gone(self):
         b = self._bench()

@@ -37,6 +37,7 @@ class FakeSystem:
         self.port_write_fails = False
         self.live_pids = set()
         self.realpaths = {}
+        self.watchdog_pids = set()      # live pids that ARE the link watchdog
 
     def _t(self):
         return self.clock.monotonic()
@@ -148,6 +149,8 @@ class FakeSystem:
         return True
 
     def pid_cmdline(self, pid):
+        if pid in self.watchdog_pids:
+            return b'/bin/sh\x00/data/e3372_linkwatch.sh\x00'
         if pid == self.udhcpc_pid:
             return b'udhcpc\x00-i\x00wwan0\x00'
         return b''
