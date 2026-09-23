@@ -49,8 +49,7 @@ v1.5
     Tests: 74 offline scenarios; the shell benches run the real helpers
         against a fake sysfs tree and real background processes, pass under
         BusyBox on the Pi, and lint every shell file for the editing
-        artefacts (a backslash-newline turned into a literal '
-', raw
+        artefacts (a backslash-newline turned into a literal '\n', raw
         control characters) that slipped through more than once.
 
 v1.4
