@@ -18,8 +18,40 @@ v1.5
         editing tool; one of them would have been deleted by setup's own CR
         stripping, silently disabling the Windows line-ending tolerance of the
         helper's config reader.
-    Tests: 71 offline scenarios; the shell benches now also cover the
-        collateral guard against a fake controller subtree.
+    Fix: exactly one link watchdog. Three copies were found running side
+        by side on the Pi, one still on v1.4 code: the TERM trap removed the
+        pidfile and then let the script carry on, so every kill left an
+        unlocked watchdog behind and the next start added another. A signal
+        now stops it, only the owner of the lock may remove it, and a process
+        scan backs the lock up. The watchdog honours LINKWATCH=0 itself.
+    Fix: a watchdog is recognised by its exact command shape
+        ('<sh> <path>/e3372_linkwatch.sh'), not by its name: a looser match
+        killed the very SSH shell that was running the stopper.
+    Fix: setup installs every helper by rename instead of overwriting it in
+        place (a running script was being rewritten under its feet), stops
+        every running watchdog and starts exactly one on the new code.
+    Fix: exactly one DHCP client on wwan0. A udhcpc was found alive after
+        21 hours: two had been started in the same second, the second one
+        overwrote the first one's pid, and every restart since had killed
+        only the pidfile's client while the orphan fought the current one
+        over the lease. Clients are now found by command line; a restart
+        stops all of them, a minute-by-minute check keeps only one, and the
+        USB helper and the link bring-up script do the same.
+    Fix: the USB helper and the link bring-up script had the same trap
+        shape as the watchdog; a signal now undoes and stops.
+    Validated in situ (2026-09-23): USB re-enumeration run three times -
+        normally, with the helper killed between its two writes (repaired by
+        its guard at 60 s), and with the helper and its guard killed
+        (repaired by the watchdog from the intent journal at 100 s). The
+        BMV-712 on the neighbouring port stayed present throughout. The
+        controller rebind refused on the real sysfs, and acted only on
+        explicit acceptance (tested against dummy bind/unbind files).
+    Tests: 74 offline scenarios; the shell benches run the real helpers
+        against a fake sysfs tree and real background processes, pass under
+        BusyBox on the Pi, and lint every shell file for the editing
+        artefacts (a backslash-newline turned into a literal '
+', raw
+        control characters) that slipped through more than once.
 
 v1.4
     Measured on the hardware on 2026-09-22, and it changes the design:
