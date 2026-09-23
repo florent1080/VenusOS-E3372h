@@ -20,6 +20,14 @@ packageDir="$(dirname "$(realpath "$0")")"
 source "/data/SetupHelper/HelperResources/IncludeHelpers"
 #### end of lines to include helper resources
 
+# Stop every running copy of the link watchdog, whatever its pidfile says.
+stop_linkwatch() {
+    for d in /proc/[0-9]*; do
+        tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q 'e3372_linkwatch\.sh' && kill -9 "${d#/proc/}" 2>/dev/null
+    done
+    rm -f /var/run/e3372-linkwatch.pid
+}
+
 #### running manually and target just install or uninstall
 if [ $scriptAction == 'NONE' ] ; then
     echo
@@ -38,34 +46,31 @@ if [ $scriptAction == 'INSTALL' ] ; then
     udevadm control --reload-rules 2>/dev/null
     logMessage "udev rules installed"
 
-    # Install NCM connect script
-    cp "$packageDir/e3372_connect.sh" /data/e3372_connect.sh
-    # Strip CR in case the package was copied from a Windows working tree
-    # (CRLF breaks the shebang on BusyBox: "bad interpreter: /bin/sh^M")
-    sed -i 's/\r//g' /data/e3372_connect.sh
-    chmod +x /data/e3372_connect.sh
-    logMessage "NCM connect script installed"
+    # Install the helpers into /data. Each one is written to a temporary file
+    # and renamed into place: a copy that is running right now (the link
+    # watchdog runs for ever) keeps reading its old file instead of having it
+    # truncated and rewritten under its feet. CR is stripped in case the package
+    # came from a Windows working tree (CRLF breaks the shebang on BusyBox).
+    install_helper() {
+        cp "$packageDir/$1" "/data/$1.new" &&
+        sed -i 's/\r//g' "/data/$1.new" &&
+        chmod +x "/data/$1.new" &&
+        mv -f "/data/$1.new" "/data/$1"
+    }
+    install_helper e3372_connect.sh     # NCM link bring-up, run by udev
+    install_helper e3372_usb_reset.sh   # USB rungs, run detached
+    install_helper e3372_linkwatch.sh   # last-resort watchdog, runs detached
+    install_helper e3372_at.py          # AT queries on the second channel
+    logMessage "helpers installed"
 
-    # Install USB reset helper (last rung of the recovery ladder, launched
-    # detached by the modem service)
-    cp "$packageDir/e3372_usb_reset.sh" /data/e3372_usb_reset.sh
-    sed -i 's/\r//g' /data/e3372_usb_reset.sh
-    chmod +x /data/e3372_usb_reset.sh
-    logMessage "USB reset helper installed"
-
-    # Install the last-resort link watchdog (started detached by the service;
-    # it is the only thing that can reset the USB port once the modem's tty is
-    # gone and serial-starter has killed the service)
-    cp "$packageDir/e3372_linkwatch.sh" /data/e3372_linkwatch.sh
-    sed -i 's/\r//g' /data/e3372_linkwatch.sh
-    chmod +x /data/e3372_linkwatch.sh
-    logMessage "link watchdog installed"
-
-    # Install the AT query tool (diagnostics on the second AT channel)
-    cp "$packageDir/e3372_at.py" /data/e3372_at.py
-    sed -i 's/\r//g' /data/e3372_at.py
-    chmod +x /data/e3372_at.py
-    logMessage "AT query tool installed"
+    # Restart the link watchdog on the new code: a running copy would carry
+    # on with the old one for as long as the GX stays up. Up to v1.4 it also
+    # swallowed SIGTERM, so every copy is stopped with SIGKILL - it holds no
+    # state that needs a clean exit, and a USB helper it may have started
+    # runs on its own and undoes itself.
+    stop_linkwatch
+    setsid nohup /data/e3372_linkwatch.sh > /dev/null 2>&1 &
+    logMessage "link watchdog restarted"
 
     # Persistent recovery journal
     mkdir -p /data/log/e3372
@@ -105,10 +110,7 @@ if [ $scriptAction == 'UNINSTALL' ] ; then
     logMessage "NCM connect script removed"
 
     # Remove the helpers (the recovery journal in /data/log/e3372 is kept)
-    if [ -f /var/run/e3372-linkwatch.pid ] ; then
-        kill "$(cat /var/run/e3372-linkwatch.pid)" 2>/dev/null
-        rm -f /var/run/e3372-linkwatch.pid
-    fi
+    stop_linkwatch
     rm -f /data/e3372_usb_reset.sh /data/e3372_linkwatch.sh /data/e3372_at.py
     logMessage "USB reset helper and link watchdog removed"
 

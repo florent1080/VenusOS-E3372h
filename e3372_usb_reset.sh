@@ -171,7 +171,15 @@ portcycle)
     # Four independent layers make sure the port comes back up: this trap, the
     # guard child below, the intent journal, and the fact that a reboot clears
     # sysfs anyway.
-    trap 'echo 0 > "$PORT/disable" 2>/dev/null; [ -n "$PEER" ] && echo 0 > "$PEER/disable" 2>/dev/null; clear_intent' EXIT INT TERM HUP
+    undo_port() {
+        echo 0 > "$PORT/disable" 2>/dev/null
+        [ -n "$PEER" ] && echo 0 > "$PEER/disable" 2>/dev/null
+        clear_intent
+    }
+    # A signal must undo AND stop: a trap that only undoes lets the script
+    # carry on as if nothing had happened.
+    trap 'undo_port' EXIT
+    trap 'undo_port; exit 1' INT TERM HUP
     ( sleep "$GUARD_AFTER"
       if [ "$(cat "$PORT/disable" 2>/dev/null)" = "1" ]; then
           echo 0 > "$PORT/disable" 2>/dev/null
@@ -223,7 +231,12 @@ rebind)
     fi
     say "rebinding controller $HCI${OTHERS:+ (also re-enumerates: $OTHERS)}"
     write_intent rebind "$DRV" "" bind "$HCI"
-    trap 'echo "$HCI" > "$DRV/bind" 2>/dev/null; clear_intent' EXIT INT TERM HUP
+    undo_bind() {
+        echo "$HCI" > "$DRV/bind" 2>/dev/null
+        clear_intent
+    }
+    trap 'undo_bind' EXIT
+    trap 'undo_bind; exit 1' INT TERM HUP
     ( sleep "$GUARD_AFTER"
       if [ ! -e "$DRV/$HCI" ]; then
           echo "$HCI" > "$DRV/bind" 2>/dev/null

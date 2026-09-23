@@ -154,23 +154,97 @@ rm -rf "$TMP/sys/bus/usb/devices/3-1"
 if modem_sysfs > /dev/null; then bad "found a modem that is not there"
 else ok "reports the modem as absent"; fi
 
+# --- 6. exactly one watchdog, and a signal really stops it ----------------
+# Found in the field: the TERM trap removed the lock and let the script carry
+# on, so every 'kill' left an unlocked watchdog running and the next start
+# added another one. Three were found running side by side.
+
+# Sets TOOK. Must NOT be called as $(...): a subshell cannot wait for its
+# parent's children, so 'wait' would return at once and every check below
+# would pass whatever the script did.
+elapsed_wait() {
+    t0=$(date +%s); wait "$1" 2>/dev/null; t1=$(date +%s); TOOK=$((t1 - t0))
+}
+
+setup
+load_watchdog
+PIDFILE="$TMP/run/linkwatch.pid"
+(
+    acquire_instance || exit 9
+    : > "$TMP/child_ready"
+    n=0; while [ $n -lt 20 ]; do sleep 1; n=$((n + 1)); done
+) &
+child=$!
+n=0; while [ ! -f "$TMP/child_ready" ] && [ $n -lt 10 ]; do sleep 1; n=$((n + 1)); done
+[ -f "$PIDFILE" ] && ok "the lock is taken" || bad "the lock was not taken"
+kill -TERM "$child" 2>/dev/null
+elapsed_wait "$child"; took=$TOOK
+if [ "$took" -lt 5 ]; then ok "SIGTERM stops it (${took}s)"; else bad "SIGTERM did not stop it (${took}s)"; fi
+if [ -f "$PIDFILE" ]; then bad "its lock was left behind"; else ok "its lock is released on the way out"; fi
+
+setup
+load_watchdog
+PIDFILE="$TMP/run/linkwatch.pid"
+printf '99999999\n' > "$PIDFILE"
+cleanup
+check "a lock owned by someone else is left alone" "$(cat "$PIDFILE")" "99999999"
+
+setup
+load_watchdog
+PIDFILE="$TMP/run/linkwatch.pid"
+sleep 30 &
+live=$!
+printf '%s\n' "$live" > "$PIDFILE"
+if acquire_instance; then bad "started although the lock owner is alive"
+else ok "does not start while the lock owner is alive"; fi
+kill "$live" 2>/dev/null; wait "$live" 2>/dev/null
+
+setup
+load_watchdog
+PIDFILE="$TMP/run/linkwatch.pid"
+printf '99999999\n' > "$PIDFILE"
+if ( acquire_instance ); then ok "a stale lock does not block the start"
+else bad "a stale lock blocked the start"; fi
+
+setup
+load_watchdog
+sh -c 'sleep 30; :' e3372_linkwatch.sh &
+fake=$!
+sleep 1
+if other_instance; then ok "a running copy is found even without its lock"
+else bad "a running copy without a lock went unnoticed"; fi
+kill "$fake" 2>/dev/null; wait "$fake" 2>/dev/null
+
+# --- 7. setup stops every copy, whatever the pidfile says ------------------
+eval "$(sed -n '/^stop_linkwatch() {/,/^}/p' "$PKG/setup")"
+sh -c 'sleep 30; :' /data/e3372_linkwatch.sh &
+a=$!
+sh -c 'sleep 30; :' e3372_linkwatch.sh &
+b=$!
+sleep 1
+stop_linkwatch
+elapsed_wait "$a"; took_a=$TOOK
+elapsed_wait "$b"; took_b=$TOOK
+if [ "$took_a" -lt 5 ] && [ "$took_b" -lt 5 ]; then ok "setup stops every running copy"
+else bad "setup left a copy running (${took_a}s, ${took_b}s)"; fi
+
 echo
 echo "== source-level guarantees =="
 
-# --- 6. no command that can strand the modem ------------------------------
+# --- 8. no command that can strand the modem ------------------------------
 for f in "$PKG/e3372_linkwatch.sh" "$PKG/e3372_usb_reset.sh" "$PKG/e3372_connect.sh"; do
     n=$(grep -c -E 'CFUN=0|CFUN=4|CFUN=6|CFUN=7|COPS=2|CGATT=0' "$f" || true)
     check "no radio-off command in $(basename "$f")" "$n" "0"
 done
 
-# --- 7. the controller rebind is never done blindly -----------------------
+# --- 9. the controller rebind is never done blindly -----------------------
 if grep -q 'for hci in' "$PKG/e3372_usb_reset.sh"; then
     bad "the rebind loops over every controller"
 else
     ok "the rebind targets one named controller"
 fi
 
-# --- 8. every helper parses under a POSIX shell ---------------------------
+# --- 10. every helper parses under a POSIX shell ---------------------------
 for f in "$PKG"/*.sh; do
     if sh -n "$f" 2>/dev/null; then ok "sh -n $(basename "$f")"
     else bad "sh -n $(basename "$f")"; fi

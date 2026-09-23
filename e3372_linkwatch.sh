@@ -143,22 +143,46 @@ at_reset() {
     link_alive
 }
 
-# The test bench sources this file to exercise the helpers below against a
-# fake sysfs tree; it must stop before taking the pidfile and entering the
-# loop. In normal use the variable is unset and this is a no-op.
+# --- single instance -------------------------------------------------------
+# The pidfile is the lock. Until v1.5 the TERM trap removed it and then let
+# the script carry on, so every 'kill' left a running watchdog without a lock
+# and the next start added another one: three were found running side by
+# side. Now a signal really stops the script, only the owner may remove the
+# lock, and a process scan backs the lock up.
+cleanup() {
+    [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"
+}
+
+other_instance() {
+    for d in /proc/[0-9]*; do
+        [ "${d#/proc/}" = "$$" ] && continue
+        tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q 'e3372_linkwatch\.sh' && return 0
+    done
+    return 1
+}
+
+acquire_instance() {
+    if [ -f "$PIDFILE" ]; then
+        old=$(cat "$PIDFILE" 2>/dev/null)
+        [ -n "$old" ] && [ "$old" != "$$" ] && [ -d "/proc/$old" ] && return 1
+    fi
+    other_instance && return 1
+    echo $$ > "$PIDFILE"
+    trap 'cleanup' EXIT
+    trap 'cleanup; exit 0' INT TERM HUP
+    return 0
+}
+
+# The test bench sources this file to exercise the helpers above against a
+# fake sysfs tree; it must stop before taking the lock and entering the loop.
+# In normal use the variable is unset and this is a no-op.
 if [ -n "$LINKWATCH_SOURCE_ONLY" ]; then
     return 0 2>/dev/null || exit 0
 fi
 
-# Single instance, even across restarts of the modem service.
-if [ -f "$PIDFILE" ]; then
-    old=$(cat "$PIDFILE" 2>/dev/null)
-    if [ -n "$old" ] && [ -d "/proc/$old" ]; then
-        exit 0
-    fi
-fi
-echo $$ > "$PIDFILE"
-trap 'rm -f "$PIDFILE"' EXIT INT TERM
+# LINKWATCH=0 disables the watchdog, whoever starts it (service or setup).
+[ "$(conf_get LINKWATCH 1)" = "0" ] && exit 0
+acquire_instance || exit 0
 
 say "linkwatch started (pid $$, first action after ${STEP1_AFTER}s, hci_reset=$HCI_RESET)"
 

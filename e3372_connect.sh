@@ -30,7 +30,8 @@ if ! mkdir "$LOCKDIR" 2>/dev/null; then
     echo "$(date) - already running, skipping (trigger: ${1:-manual})"
     exit 0
 fi
-trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT INT TERM
+trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
+trap 'exit 1' INT TERM
 
 echo "$(date) - e3372_connect.sh started (trigger: ${1:-manual})"
 
