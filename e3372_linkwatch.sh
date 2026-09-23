@@ -153,10 +153,15 @@ cleanup() {
     [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"
 }
 
+# A watchdog runs as exactly "/bin/sh /data/e3372_linkwatch.sh": an interpreter
+# and the script, nothing else. Matching that shape and not just the name
+# matters - an SSH command or an editor that merely mentions the file must
+# never be taken for a running copy (a looser match killed the very shell
+# that was running it).
 other_instance() {
     for d in /proc/[0-9]*; do
         [ "${d#/proc/}" = "$$" ] && continue
-        tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q 'e3372_linkwatch\.sh' && return 0
+        tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q '^[^ ]*sh [^ ]*e3372_linkwatch\.sh $' && return 0
     done
     return 1
 }

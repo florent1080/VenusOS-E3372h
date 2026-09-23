@@ -206,20 +206,37 @@ printf '99999999\n' > "$PIDFILE"
 if ( acquire_instance ); then ok "a stale lock does not block the start"
 else bad "a stale lock blocked the start"; fi
 
+# A stand-in shaped exactly like a running watchdog: "<sh> <path>/e3372_linkwatch.sh".
+fake_watchdog() {
+    mkdir -p "$TMP/fake"
+    printf 'sleep 30; :\n' > "$TMP/fake/e3372_linkwatch.sh"
+    sh "$TMP/fake/e3372_linkwatch.sh" &
+}
+
 setup
 load_watchdog
-sh -c 'sleep 30; :' e3372_linkwatch.sh &
+fake_watchdog
 fake=$!
 sleep 1
 if other_instance; then ok "a running copy is found even without its lock"
 else bad "a running copy without a lock went unnoticed"; fi
 kill "$fake" 2>/dev/null; wait "$fake" 2>/dev/null
 
+# A shell whose command line merely MENTIONS the script is not a watchdog.
+# Taking it for one is how an install over SSH killed its own session.
+setup
+load_watchdog
+sh -c ': e3372_linkwatch.sh; sleep 30; :' &
+bystander=$!
+sleep 1
+if other_instance; then bad "a command that mentions the script was taken for a watchdog"
+else ok "a command that merely mentions the script is not a watchdog"; fi
+
 # --- 7. setup stops every copy, whatever the pidfile says ------------------
 eval "$(sed -n '/^stop_linkwatch() {/,/^}/p' "$PKG/setup")"
-sh -c 'sleep 30; :' /data/e3372_linkwatch.sh &
+fake_watchdog
 a=$!
-sh -c 'sleep 30; :' e3372_linkwatch.sh &
+fake_watchdog
 b=$!
 sleep 1
 stop_linkwatch
@@ -227,6 +244,9 @@ elapsed_wait "$a"; took_a=$TOOK
 elapsed_wait "$b"; took_b=$TOOK
 if [ "$took_a" -lt 5 ] && [ "$took_b" -lt 5 ]; then ok "setup stops every running copy"
 else bad "setup left a copy running (${took_a}s, ${took_b}s)"; fi
+if kill -0 "$bystander" 2>/dev/null; then ok "setup spares a command that merely mentions the script"
+else bad "setup killed a bystander that merely mentions the script"; fi
+kill "$bystander" 2>/dev/null; wait "$bystander" 2>/dev/null
 
 echo
 echo "== source-level guarantees =="

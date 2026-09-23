@@ -1802,7 +1802,11 @@ class ModemService:
             return
         try:
             pid = int((self.sysx.read(LINKWATCH_PIDFILE) or '').strip())
-            if self.sysx.exists('/proc/%d' % pid):
+            # The pid must still be alive AND still be the watchdog: pids are
+            # reused, and a stale pidfile naming some other process would
+            # otherwise leave the GX without its last-resort layer.
+            if self.sysx.exists('/proc/%d' % pid) \
+                    and b'e3372_linkwatch' in self.sysx.pid_cmdline(pid):
                 log.info('linkwatch already running (pid %d)', pid)
                 return
         except ValueError:
