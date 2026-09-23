@@ -246,6 +246,48 @@ class EffectivenessTests(unittest.TestCase):
         self.assertTrue(b.spawned('rebind'))      # so it escalated further
 
 
+class ControllerRebindTests(unittest.TestCase):
+    """Rebinding the USB controller re-enumerates everything on it. On the
+    reference install that includes the BMV-712 battery monitor - the active
+    battery service, with DVCC on - so the rung must look before it acts."""
+
+    def _stubborn(self, **kw):
+        b = harness.Bench(**kw)
+        b.modem.creg = 3
+        b.modem.creg_after_reset = 3      # nothing but the last rung is left
+        return b
+
+    def test_refused_when_the_battery_monitor_shares_the_controller(self):
+        b = self._stubborn()
+        b.system.add_usb_device('3-2', '0403', '6001', 'TTL232R-3V3')
+        b.start()
+        b.run(3 * 3600)
+        self.assertTrue(b.spawned('portcycle'))       # the rungs below still run
+        self.assertEqual(b.spawned('rebind'), [])
+        refusals = b.logs('controller rebind refused: 3-2 (TTL232R-3V3) also on xhci-hcd.1')
+        self.assertTrue(refusals, b.logs('recovery:'))
+        hist = [h for h in (b.state_file() or {}).get('history', [])
+                if h['rung'] == 'HCI_REBIND']
+        self.assertTrue(hist and all(h['result'] == 'impossible' for h in hist), hist)
+
+    def test_allowed_when_the_owner_accepted_the_collateral(self):
+        b = self._stubborn(extra_cfg={'HCI_REBIND_SHARED': '1'})
+        b.system.add_usb_device('3-2', '0403', '6001', 'TTL232R-3V3')
+        b.start()
+        b.run(3 * 3600)
+        self.assertTrue(b.spawned('rebind'))
+        self.assertEqual(b.logs('controller rebind refused'), [])
+
+    def test_devices_on_the_other_controller_do_not_block_it(self):
+        b = self._stubborn()
+        b.system.add_usb_device('1-2.1', '1a86', '7523', 'USB Serial', hci='xhci-hcd.0')
+        b.system.add_usb_device('1-1', '1546', '01a7', 'u-blox 7', hci='xhci-hcd.0')
+        b.start()
+        b.run(3 * 3600)
+        self.assertTrue(b.spawned('rebind'))
+        self.assertEqual(b.logs('controller rebind refused'), [])
+
+
 class LevelTests(unittest.TestCase):
 
     def test_level_1_stops_before_the_modem_reset(self):

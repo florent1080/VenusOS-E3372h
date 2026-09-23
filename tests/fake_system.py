@@ -36,6 +36,7 @@ class FakeSystem:
         self.rx_bytes = 1000
         self.port_write_fails = False
         self.live_pids = set()
+        self.realpaths = {}
 
     def _t(self):
         return self.clock.monotonic()
@@ -114,7 +115,19 @@ class FakeSystem:
     DEVPATH = ('/sys/devices/platform/axi/1000120000.pcie/1f00300000.usb/'
                'xhci-hcd.1/usb3/3-1')
 
+    def add_usb_device(self, name, vid, pid, product, hci='xhci-hcd.1'):
+        """Put another device on the bus, under the given controller."""
+        base = '/sys/bus/usb/devices/' + name
+        self.files[base + '/idVendor'] = vid
+        self.files[base + '/idProduct'] = pid
+        self.files[base + '/product'] = product
+        root = 'usb3' if hci == 'xhci-hcd.1' else 'usb1'
+        self.realpaths[base] = ('/sys/devices/platform/axi/1000120000.pcie/x.usb/'
+                                '%s/%s/%s' % (hci, root, name))
+
     def realpath(self, path):
+        if path in self.realpaths:
+            return self.realpaths[path]
         if path == SYSFS_DEV:
             return self.DEVPATH
         if path.startswith('/sys/class/tty/'):

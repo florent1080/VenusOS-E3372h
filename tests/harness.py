@@ -43,7 +43,8 @@ def load_service():
 
 class Bench:
     def __init__(self, level=4, timescale=1.0, probe_hosts='8.8.8.8,1.1.1.1',
-                 settings=None, tty='/dev/ttyUSB1', start_time=1000.0, linkwatch='1'):
+                 settings=None, tty='/dev/ttyUSB1', start_time=1000.0, linkwatch='1',
+                 extra_cfg=None):
         self.clock = fake_clock.FakeClock(start_time)
         self.modem = fake_modem.FakeModem(self.clock)
         stubs.CURRENT['modem'] = self.modem
@@ -57,7 +58,7 @@ class Bench:
         self.cfg = self.mod.Config(raw={
             'APN': 'test.apn', 'PROBE_HOST': probe_hosts,
             'RECOVERY_LEVEL': str(level), 'RECOVERY_TIMESCALE': str(timescale),
-            'LINKWATCH': linkwatch})
+            'LINKWATCH': linkwatch, **(extra_cfg or {})})
         self.svc = None
         self.next_poll = None
         self.restarts = 0

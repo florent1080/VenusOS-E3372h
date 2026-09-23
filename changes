@@ -1,3 +1,26 @@
+v1.5
+    Fix: the USB controller rebind no longer runs blind. It re-enumerates
+        every device on the modem's controller, and v1.4 was released on the
+        claim that nothing else useful sat there. That claim was wrong: on
+        the reference install the other device is the VE.Direct cable of the
+        BMV-712, the active battery service, with DVCC on. The rung now lists
+        the other devices on the controller and refuses when there are any,
+        logging what it would have taken down; the ladder then moves on. The
+        check runs in the service before it spends a destructive slot, and
+        again in the helper, so no caller can bypass it. HCI_REBIND_SHARED=1
+        accepts the collateral explicitly.
+    Fix: the link watchdog remembers the modem's controller while the modem
+        is visible, so its last step still knows what to target once the
+        modem has left the bus, and it recognises a refusal instead of
+        counting it as a destructive action.
+    Fix: a regular-expression back-reference and two escape sequences in the
+        shell helpers had been turned into raw control characters by the
+        editing tool; one of them would have been deleted by setup's own CR
+        stripping, silently disabling the Windows line-ending tolerance of the
+        helper's config reader.
+    Tests: 71 offline scenarios; the shell benches now also cover the
+        collateral guard against a fake controller subtree.
+
 v1.4
     Measured on the hardware on 2026-09-22, and it changes the design:
       - AT^RESET is the ONLY command that restarts this firmware, and the

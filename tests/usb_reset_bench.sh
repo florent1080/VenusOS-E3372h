@@ -1,0 +1,100 @@
+#!/bin/sh
+# Offline bench for the collateral guard of e3372_usb_reset.sh.
+#
+# Rebinding the modem's USB controller re-enumerates every device on it. On
+# the reference install that includes the VE.Direct cable of the BMV-712, the
+# active battery service with DVCC on - so the helper must refuse to rebind a
+# shared controller unless the owner explicitly accepted it. This sources the
+# REAL helper and exercises its discovery against a fake controller subtree
+# made of plain directories (no symlinks, so it also runs under Git Bash).
+#
+# Usage: sh tests/usb_reset_bench.sh
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+PKG=$(dirname "$HERE")
+TMP=${TMPDIR:-/tmp}/e3372-usbbench.$$
+PASS=0
+FAIL=0
+
+ok()   { PASS=$((PASS + 1)); echo "  ok   - $1"; }
+bad()  { FAIL=$((FAIL + 1)); echo "  FAIL - $1"; }
+check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (got '$2', want '$3')"; fi; }
+
+mkdev() {   # mkdev <dir> <vid> <product>
+    mkdir -p "$1"
+    printf '%s\n' "$2" > "$1/idVendor"
+    printf '%s\n' "$3" > "$1/product"
+}
+
+setup() {
+    rm -rf "$TMP"
+    HD="$TMP/sys/devices/platform/axi/x.usb/xhci-hcd.1"
+    mkdev "$HD/usb3" 1d6b "xHCI Host Controller"
+    mkdev "$HD/usb4" 1d6b "xHCI Host Controller"
+    mkdev "$HD/usb3/3-1" 12d1 "HUAWEI_MOBILE"
+    MODEM="$HD/usb3/3-1"
+}
+
+# Load the helper's functions without running it.
+USB_RESET_SOURCE_ONLY=1
+export USB_RESET_SOURCE_ONLY
+. "$PKG/e3372_usb_reset.sh"
+
+echo "== e3372_usb_reset.sh: controller rebind guard =="
+
+setup
+check "the modem alone: nothing else would be touched" \
+      "$(hci_collateral "$HD" "$MODEM" | tr '\n' ' ')" ""
+
+setup
+mkdev "$HD/usb3/3-2" 0403 "TTL232R-3V3"
+check "the BMV cable next to the modem is found" \
+      "$(hci_collateral "$HD" "$MODEM" | tr '\n' ' ')" "3-2 (TTL232R-3V3) "
+
+setup
+mkdev "$HD/usb3/3-2" 1a40 "USB 2.0 Hub"
+mkdev "$HD/usb3/3-2/3-2.1" 1a86 "USB Serial"
+got=$(hci_collateral "$HD" "$MODEM" | sort | tr '\n' ' ')
+check "a device behind a hub is found too" "$got" "3-2 (USB 2.0 Hub) 3-2.1 (USB Serial) "
+
+setup
+check "root hubs are never counted" \
+      "$(hci_collateral "$HD" "$MODEM" | grep -c 1d6b)" "0"
+
+# the modem already gone from the bus: everything else still counts
+setup
+mkdev "$HD/usb3/3-2" 0403 "TTL232R-3V3"
+rm -rf "$MODEM"
+check "with the modem absent, the neighbour is still found" \
+      "$(hci_collateral "$HD" "" | tr '\n' ' ')" "3-2 (TTL232R-3V3) "
+
+# the acceptance switch is read safely
+setup
+CONF="$TMP/e3372-config.conf"
+printf 'HCI_REBIND_SHARED=1\r\n' > "$CONF"
+check "the acceptance survives a Windows line ending" "$(conf_get HCI_REBIND_SHARED 0)" "1"
+printf 'HCI_REBIND_SHARED=yes please\n' > "$CONF"
+check "anything but a number means no" "$(conf_get HCI_REBIND_SHARED 0)" "0"
+rm -f "$CONF"
+check "absent means no" "$(conf_get HCI_REBIND_SHARED 0)" "0"
+
+echo
+echo "== source-level guarantees =="
+
+# the guard runs before the controller is ever unbound
+guard=$(grep -n 'hci_collateral "\$HCIDIR"' "$PKG/e3372_usb_reset.sh" | head -n 1 | cut -d: -f1)
+unbind=$(grep -n '> "\$DRV/unbind"' "$PKG/e3372_usb_reset.sh" | head -n 1 | cut -d: -f1)
+if [ -n "$guard" ] && [ -n "$unbind" ] && [ "$guard" -lt "$unbind" ]; then
+    ok "the collateral check comes before the unbind (lines $guard < $unbind)"
+else
+    bad "the collateral check must come before the unbind (guard=$guard unbind=$unbind)"
+fi
+if grep -q 'exit 3' "$PKG/e3372_usb_reset.sh"; then ok "a refusal exits with its own status"
+else bad "no distinct exit status for a refusal"; fi
+if grep -q '"\$rc" = 3' "$PKG/e3372_linkwatch.sh"; then ok "the watchdog recognises a refusal"
+else bad "the watchdog does not recognise a refusal"; fi
+
+rm -rf "$TMP"
+echo
+echo "passed: $PASS   failed: $FAIL"
+[ "$FAIL" = 0 ]

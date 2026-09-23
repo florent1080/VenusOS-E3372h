@@ -23,6 +23,7 @@
 # tty disappear and serial-starter then kills the service: nothing else would
 # be left to write the port back.
 
+CONF=/data/e3372-config.conf
 LOG=/data/log/e3372/usbreset.log
 LINKLOG=/var/log/e3372.log
 PIDFILE=/var/run/udhcpc.wwan0.pid
@@ -70,6 +71,33 @@ find_port() {
     return 1
 }
 
+# Read one numeric key from the user-editable config without sourcing it.
+conf_get() {
+    v=$(sed -n "s/^[ 	]*$1[ 	]*=[ 	]*//p" "$CONF" 2>/dev/null \
+        | tail -n 1 | tr -d '\r' | sed 's/^"//; s/"$//')
+    case "$v" in
+        ''|*[!0-9]*) echo "$2" ;;
+        *)           echo "$v" ;;
+    esac
+}
+
+# Every USB device under a controller, other than the modem itself and the
+# root hubs. Rebinding the controller re-enumerates all of them: on the
+# reference install that includes the VE.Direct cable of the BMV-712, the
+# active battery service. Walks the controller's own subtree, so it needs no
+# symlink to be followed.
+hci_collateral() {
+    hdir=$1
+    self=$2
+    [ -d "$hdir" ] || return 0
+    find "$hdir" -name idVendor 2>/dev/null | while read -r f; do
+        d=$(dirname "$f")
+        [ "$d" = "$self" ] && continue
+        [ "$(cat "$f" 2>/dev/null)" = "1d6b" ] && continue     # root hub
+        echo "$(basename "$d") ($(cat "$d/product" 2>/dev/null))"
+    done
+}
+
 find_hci() {
     readlink -f "$1" | sed -n 's#.*/\(xhci-hcd\.[0-9]*\)/.*#\1#p'
 }
@@ -106,6 +134,12 @@ wait_back() {
     done
     [ -n "$(find_dev)" ]
 }
+
+# The test bench sources this file to exercise the helpers above; it must stop
+# before acting. In normal use the variable is unset and this is a no-op.
+if [ -n "$USB_RESET_SOURCE_ONLY" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # ---------------------------------------------------------------------------
 
@@ -178,9 +212,16 @@ rebind)
         say "cannot work out the controller (hci='${HCI:-}'), nothing to do"
         exit 1
     fi
-    # Only ever the controller carrying the modem. Rebinding the other one
-    # would take out the VE.Direct adapters and the GPS.
-    say "rebinding controller $HCI"
+    # Only ever the controller carrying the modem, and only if the modem is
+    # alone on it - unless the owner explicitly accepted the collateral.
+    HCIDIR=$(readlink -f "$DRV/$HCI" 2>/dev/null)
+    SELF=$( [ -n "$DEV" ] && readlink -f "$DEV" )
+    OTHERS=$(hci_collateral "$HCIDIR" "$SELF" | tr '\n' ' ')
+    if [ -n "$OTHERS" ] && [ "$(conf_get HCI_REBIND_SHARED 0)" != "1" ]; then
+        say "REFUSED: ${OTHERS}share $HCI with the modem and would be re-enumerated too (set HCI_REBIND_SHARED=1 in $CONF to accept that)"
+        exit 3
+    fi
+    say "rebinding controller $HCI${OTHERS:+ (also re-enumerates: $OTHERS)}"
     write_intent rebind "$DRV" "" bind "$HCI"
     trap 'echo "$HCI" > "$DRV/bind" 2>/dev/null; clear_intent' EXIT INT TERM HUP
     ( sleep "$GUARD_AFTER"

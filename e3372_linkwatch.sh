@@ -164,6 +164,7 @@ say "linkwatch started (pid $$, first action after ${STEP1_AFTER}s, hci_reset=$H
 
 down_since=0
 step=0
+modem_hci=""
 last_step_at=0
 last_hci=0
 cycle=0
@@ -200,6 +201,9 @@ while true; do
     step=$((step + 1))
     last_step_at=$now
     dev=$(modem_sysfs)
+    if [ -n "$dev" ]; then
+        modem_hci=$(readlink -f "$dev" | sed -n 's#.*/\(xhci-hcd\.[0-9]*\)/.*#\1#p')
+    fi
 
     case "$step" in
     1)
@@ -226,12 +230,21 @@ while true; do
             say "step 4 skipped: LINKWATCH_HCI_RESET is not 1"
         elif [ "$last_hci" != 0 ] && [ $((now - last_hci)) -lt "$HCI_GAP" ]; then
             say "step 4 held: the controller was rebound $((now - last_hci))s ago"
+        elif [ -z "$modem_hci" ]; then
+            say "step 4 skipped: the modem's controller was never seen"
         else
-            say "step 4: rebinding the modem's USB controller"
-            last_hci=$now
-            mark_destructive
-            [ -x "$USB_RESET" ] && "$USB_RESET" rebind "$dev" >> "$LOG" 2>&1
-            sleep 30
+            say "step 4: rebinding the modem's USB controller ($modem_hci)"
+            rc=0
+            [ -x "$USB_RESET" ] && { "$USB_RESET" rebind "$dev" "$modem_hci" >> "$LOG" 2>&1; rc=$?; }
+            if [ "$rc" = 3 ]; then
+                # The helper refused before touching anything: other devices
+                # share the controller. Nothing happened, so nothing is spent.
+                say "step 4 refused: other devices share $modem_hci (see usbreset.log)"
+            else
+                last_hci=$now
+                mark_destructive
+                sleep 30
+            fi
         fi
         ;;
     *)

@@ -42,7 +42,7 @@ import dbus.mainloop.glib
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = '1.4-e3372'
+VERSION = '1.5-e3372'
 
 CONFIG_FILE = '/data/e3372-config.conf'
 IFACE = 'wwan0'
@@ -274,6 +274,10 @@ class Config:
         self.probe_hosts = [h.strip() for h in hosts.split(',') if h.strip()]
         self.recovery_level = self._num(cfg.get('RECOVERY_LEVEL'), 4, 0, 4, int)
         self.linkwatch = str(cfg.get('LINKWATCH', '1')).strip() not in ('0', 'no', 'false')
+        # Rebinding the USB controller re-enumerates EVERY device on it. By
+        # default the rung refuses when the modem is not alone there.
+        self.hci_shared_ok = str(cfg.get('HCI_REBIND_SHARED', '0')).strip().lower() \
+            in ('1', 'yes', 'true')
         self.timescale = self._num(cfg.get('RECOVERY_TIMESCALE'), 1.0, 0.1, 1.0, float)
 
     @staticmethod
@@ -820,7 +824,8 @@ class Recovery:
                 # A rung that answered OK but provably changed nothing (the
                 # modem never left the bus) must not burn the rest of the
                 # settle: escalate straight away.
-                if rung and not self.verify_started                         and not self.actions.rung_was_effective(rung):
+                if rung and not self.verify_started \
+                        and not self.actions.rung_was_effective(rung):
                     if self.history:
                         self.history[-1]['result'] = 'ineffective'
                     self._advance_rung(now)
@@ -1854,6 +1859,30 @@ class ModemService:
                 return part
         return None
 
+    def _hci_collateral(self, path, hci):
+        """Every other USB device on the modem's controller.
+
+        Rebinding the controller re-enumerates all of them, so the rung must
+        not run blind. On the reference install the second device on the
+        modem's controller is the VE.Direct cable of the BMV-712 - the active
+        battery service, with DVCC on - which is exactly what an energy system
+        cannot lose to a modem recovery.
+        """
+        modem_real = self.sysx.realpath(path) if path else ''
+        base = '/sys/bus/usb/devices'
+        marker = '/%s/' % hci
+        others = []
+        for name in self.sysx.listdir(base):
+            if name.startswith('usb') or ':' in name:
+                continue                        # root hubs and interfaces
+            d = posixpath.join(base, name)
+            real = self.sysx.realpath(d)
+            if real == modem_real or marker not in real + '/':
+                continue
+            product = (self.sysx.read(posixpath.join(d, 'product')) or '').strip()
+            others.append('%s (%s)' % (name, product or 'unknown device'))
+        return sorted(others)
+
     def _query_cfun(self):
         """Current AT+CFUN? value, or None when unknown."""
         r = self.modem.at('AT+CFUN?')
@@ -1921,6 +1950,13 @@ class ModemService:
             hci = self._usb_controller(path)
             if not hci:
                 rlog.error('recovery: cannot work out the modem USB controller')
+                return 'impossible'
+            others = self._hci_collateral(path, hci)
+            if others and not self.cfg.hci_shared_ok:
+                rlog.error('recovery: controller rebind refused: %s also on %s '
+                           'and would be re-enumerated with the modem (set '
+                           'HCI_REBIND_SHARED=1 in %s to accept that)',
+                           ', '.join(others), hci, CONFIG_FILE)
                 return 'impossible'
             self.pin_attempted = False
             self._cancel_dial()
