@@ -248,23 +248,58 @@ if kill -0 "$bystander" 2>/dev/null; then ok "setup spares a command that merely
 else bad "setup killed a bystander that merely mentions the script"; fi
 kill "$bystander" 2>/dev/null; wait "$bystander" 2>/dev/null
 
+# --- 8. the clock is set as soon as the link is up, then every hour --------
+# Nothing else sets it on a 4G-only GX: on 2026-10-25 a power cut brought it
+# back in 1970 and every TLS connection failed.
+setup
+load_watchdog
+TIMESYNC="$TMP/bin/e3372_timesync.py"
+printf '#!/bin/sh\necho run >> "%s/sync_calls"\nexit $(cat "%s/sync_rc")\n' "$TMP" "$TMP" > "$TIMESYNC"
+chmod +x "$TIMESYNC"
+calls() { if [ -f "$TMP/sync_calls" ]; then wc -l < "$TMP/sync_calls" | tr -d ' '; else echo 0; fi; }
+at() { printf '%s\n' $((123456 + $1)) > "$TMP/uptime"; }
+printf '0\n' > "$TMP/sync_rc"
+next_sync=0
+sync_clock
+check "the first sync runs at once" "$(calls)" "1"
+at 60; sync_clock
+check "no second sync a minute later" "$(calls)" "1"
+at 3600; sync_clock
+check "the next sync runs an hour later" "$(calls)" "2"
+printf '1\n' > "$TMP/sync_rc"
+at 7200; sync_clock
+check "a failing sync is run" "$(calls)" "3"
+printf '0\n' > "$TMP/sync_rc"
+at 7260; sync_clock
+check "a failed sync is not retried after one minute" "$(calls)" "3"
+at 7320; sync_clock
+check "a failed sync is retried after two minutes" "$(calls)" "4"
+TIMESYNC_ON=0; next_sync=0; sync_clock
+check "TIMESYNC=0 never sets the clock" "$(calls)" "4"
+TIMESYNC_ON=1; next_sync=0; TIMESYNC="$TMP/bin/missing.py"; sync_clock
+check "a missing helper is skipped" "$(calls)" "4"
+
+printf 'TIMESYNC=0\nTIMESYNC_INTERVAL=900\r\n' > "$TMP/data/e3372-config.conf"
+check "TIMESYNC is read from the config" "$(conf_get TIMESYNC 1)" "0"
+check "TIMESYNC_INTERVAL is read from the config" "$(conf_get TIMESYNC_INTERVAL 3600)" "900"
+
 echo
 echo "== source-level guarantees =="
 
-# --- 8. no command that can strand the modem ------------------------------
+# --- 9. no command that can strand the modem ------------------------------
 for f in "$PKG/e3372_linkwatch.sh" "$PKG/e3372_usb_reset.sh" "$PKG/e3372_connect.sh"; do
     n=$(grep -c -E 'CFUN=0|CFUN=4|CFUN=6|CFUN=7|COPS=2|CGATT=0' "$f" || true)
     check "no radio-off command in $(basename "$f")" "$n" "0"
 done
 
-# --- 9. the controller rebind is never done blindly -----------------------
+# --- 10. the controller rebind is never done blindly -----------------------
 if grep -q 'for hci in' "$PKG/e3372_usb_reset.sh"; then
     bad "the rebind loops over every controller"
 else
     ok "the rebind targets one named controller"
 fi
 
-# --- 10. every helper parses under a POSIX shell ---------------------------
+# --- 11. every helper parses under a POSIX shell ---------------------------
 for f in "$PKG"/*.sh; do
     if sh -n "$f" 2>/dev/null; then ok "sh -n $(basename "$f")"
     else bad "sh -n $(basename "$f")"; fi

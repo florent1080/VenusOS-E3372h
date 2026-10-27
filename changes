@@ -1,3 +1,18 @@
+v1.6
+    New: the clock is set over the link. Venus OS gets its time from
+        connman's NTP client, which only runs while connman has a service of
+        its own online; wwan0 is not one, so on a GX whose only uplink is this
+        modem nothing ever set the clock, and the Pi 5 RTC has no battery. On
+        2026-10-25 the GX came back from a power cut in February 1970: VRM over
+        HTTPS and Tailscale both failed on certificate dates, and the VRM
+        watchdog rebooted the GX every 35 minutes for five hours.
+        e3372_timesync.py is a small SNTP client (BusyBox has no ntpd): up to
+        three servers, answers checked against the nonce of the request,
+        median offset, step above 0.5 s, never to a date older than the
+        package, then the RTC is written. The link watchdog runs it as soon as
+        the link is up, then hourly, every 2 minutes while it fails.
+        TIMESYNC, TIMESYNC_INTERVAL and TIMESYNC_SERVERS in the config.
+
 v1.5
     Fix: the USB controller rebind no longer runs blind. It re-enumerates
         every device on the modem's controller, and v1.4 was released on the

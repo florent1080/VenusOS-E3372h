@@ -15,6 +15,7 @@ Features:
   be dialled (see below). The GX itself is never rebooted.
 - SIM PIN entry from the GUI (/Settings/Modem/PIN)
 - Resident DHCP client: renews the lease and restores the default route
+- Clock set over the link (NTP), which Venus does not do on 4G (see below)
 - Automatic hotplug: reconnects on USB replug
 - Configurable APN via /data/e3372-config.conf
 - Compatible with serial-starter and Venus OS GUI
@@ -43,6 +44,9 @@ Edit /data/e3372-config.conf:
   LINKWATCH_DOWN_SECONDS=600   (how long the link must be dead first)
   LINKWATCH_HCI_RESET=1        (allow the controller rebind as a last step)
   HCI_REBIND_SHARED=0          (refuse it when other devices share the controller)
+  TIMESYNC=1                   (set the clock over the link, see below)
+  TIMESYNC_INTERVAL=3600       (seconds between two syncs)
+  TIMESYNC_SERVERS=pool.ntp.org,time.cloudflare.com,time.google.com
   RECOVERY_TIMESCALE=1.0       (tests only: shortens every recovery delay)
 
 PROBE_HOST hosts are pinged every 2 minutes through wwan0; the check passes
@@ -116,6 +120,25 @@ link stays down it escalates on its own: AT^RESET, then a USB re-enumeration,
 then the controller rebind, sharing a destructive budget with the service.
 Its log is /data/log/e3372/linkwatch.log.
 
+Clock:
+Venus OS sets its clock with connman's NTP client, which only runs while
+connman itself has a service online (WiFi, Ethernet). wwan0 is brought up by
+this package, outside connman, so when this modem is the only uplink nothing
+ever sets the clock - and the Pi 5 RTC has no battery. On 2026-10-25 the GX
+came back from a power cut in February 1970: every TLS connection failed (VRM
+over HTTPS, Tailscale), VRM lost contact, and the VRM watchdog ("reboot when
+no contact") rebooted the GX every 35 minutes for five hours.
+
+The link watchdog therefore runs /data/e3372_timesync.py as soon as the link
+is up, then every TIMESYNC_INTERVAL seconds (every 2 minutes while it fails).
+It is a small SNTP client - BusyBox on Venus has no ntpd: it asks up to three
+servers, keeps only well-formed answers that echo the nonce of its request,
+takes the median offset, steps the clock when it is off by more than 0.5 s,
+never to a date older than the package, and copies the time into the RTC so
+that a reboot (not a power cut) starts on the right time. It only logs a
+step, the first failure of a series and the first sync after a boot.
+TIMESYNC=0 disables it; it also stops with LINKWATCH=0.
+
 A PIN or PUK request, a wrong SIM, or roaming while roaming is not permitted
 are reported but never acted upon. When a whole ladder fails, the next one
 waits 15 minutes, then 30, 1 hour, 2 hours, up to 4 hours, forever: the
@@ -137,6 +160,9 @@ Troubleshooting:
 - Ladder state: dbus -y com.victronenergy.modem /Recovery/State GetValue
 - Radio state: dbus -y com.victronenergy.modem /Modem/Cfun GetValue  (1 = on)
 - USB helper log: /data/log/e3372/usbreset.log
+- Clock:        /data/log/e3372/timesync.log, last result in
+                /run/e3372-timesync.json; check without changing anything:
+                /data/e3372_timesync.py --dry-run
 - Ask the modem directly, without disturbing the service (it owns the
   serial port; /dev/cdc-wdm0 is a second, independent AT channel):
     /data/e3372_at.py 'AT^NDISSTATQRY?' 'AT+CREG?' 'AT^HCSQ?'

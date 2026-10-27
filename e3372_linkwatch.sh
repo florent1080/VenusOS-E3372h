@@ -17,6 +17,9 @@
 # host-side action changes anything inside the modem.
 #
 # It never reboots the GX.
+#
+# Being the one process that runs for as long as the link exists, it also
+# keeps the clock right (role 2 below): nothing else does on a 4G-only GX.
 
 CONF=/data/e3372-config.conf
 LOG=/data/log/e3372/linkwatch.log
@@ -28,6 +31,7 @@ BOOT_ID_FILE=/proc/sys/kernel/random/boot_id
 UPTIME_FILE=/proc/uptime
 USB_RESET=/data/e3372_usb_reset.sh
 AT=/data/e3372_at.py
+TIMESYNC=/data/e3372_timesync.py
 IFACE=wwan0
 
 CHECK_INTERVAL=60          # seconds between checks
@@ -36,6 +40,9 @@ STEP_GAP=600               # between escalation steps
 DESTRUCTIVE_GAP=900        # shared with the service's own ladder
 HCI_GAP=21600              # at most one controller rebind per 6 h
 HCI_RESET=1                # the controller carrying the modem only
+TIMESYNC_ON=1              # set the clock over the link
+TIMESYNC_EVERY=3600        # between two syncs once one has worked
+TIMESYNC_RETRY=120         # after a sync that failed
 
 mkdir -p /data/log/e3372 2>/dev/null
 say() { echo "$(date) [$(cut -d. -f1 "$UPTIME_FILE" 2>/dev/null)] - $*" >> "$LOG"; }
@@ -56,9 +63,11 @@ conf_get() {
 [ -f "$CONF" ] && {
     STEP1_AFTER=$(conf_get LINKWATCH_DOWN_SECONDS "$STEP1_AFTER")
     HCI_RESET=$(conf_get LINKWATCH_HCI_RESET "$HCI_RESET")
+    TIMESYNC_ON=$(conf_get TIMESYNC "$TIMESYNC_ON")
+    TIMESYNC_EVERY=$(conf_get TIMESYNC_INTERVAL "$TIMESYNC_EVERY")
 }
 
-now_s() { cut -d. -f1 "$UPTIME_FILE"; }   # monotonic: this GX has no NTP
+now_s() { cut -d. -f1 "$UPTIME_FILE"; }   # monotonic: the wall clock can be decades off at boot
 
 modem_sysfs() {
     for f in /sys/bus/usb/devices/*/idProduct; do
@@ -143,6 +152,25 @@ at_reset() {
     link_alive
 }
 
+# Role 2: keep the clock right. Venus sets its clock with connman's NTP
+# client, which only runs while connman itself has a service online (WiFi,
+# Ethernet). wwan0 is not one, so on a 4G-only GX nothing ever sets the clock,
+# and the Pi 5 RTC has no battery. On 2026-10-25 the GX came back from a power
+# cut in February 1970: every TLS connection failed (VRM over HTTPS,
+# Tailscale) and the VRM watchdog rebooted it every 35 minutes for five hours.
+# Called only while the link is alive: at once, then every TIMESYNC_EVERY
+# seconds, or every TIMESYNC_RETRY seconds while it fails.
+sync_clock() {
+    [ "$TIMESYNC_ON" = "1" ] || return 0
+    [ -x "$TIMESYNC" ] || return 0
+    [ "$(now_s)" -ge "${next_sync:-0}" ] || return 0
+    if "$TIMESYNC" > /dev/null 2>&1; then
+        next_sync=$(( $(now_s) + TIMESYNC_EVERY ))
+    else
+        next_sync=$(( $(now_s) + TIMESYNC_RETRY ))
+    fi
+}
+
 # --- single instance -------------------------------------------------------
 # The pidfile is the lock. Until v1.5 the TERM trap removed it and then let
 # the script carry on, so every 'kill' left a running watchdog without a lock
@@ -189,8 +217,9 @@ fi
 [ "$(conf_get LINKWATCH 1)" = "0" ] && exit 0
 acquire_instance || exit 0
 
-say "linkwatch started (pid $$, first action after ${STEP1_AFTER}s, hci_reset=$HCI_RESET)"
+say "linkwatch started (pid $$, first action after ${STEP1_AFTER}s, hci_reset=$HCI_RESET, timesync=$TIMESYNC_ON)"
 
+next_sync=0
 down_since=0
 step=0
 modem_hci=""
@@ -219,6 +248,7 @@ while true; do
         if [ "$step" != 0 ] && [ $((now - last_step_at)) -ge 3600 ]; then
             step=0; backoff=0
         fi
+        sync_clock
         continue
     fi
 
