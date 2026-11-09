@@ -11,6 +11,7 @@
 #   - USB reset helper and link watchdog (recovery ladder)
 #   - NTP clock setter over the link, run by the link watchdog
 #   - udhcpc event script that applies the lease on wwan0
+#   - "wwan" on connman's NetworkInterfaceBlacklist (/etc/connman/main.conf)
 #   - Default config file (preserves existing)
 
 packageDir="$(dirname "$(realpath "$0")")"
@@ -33,6 +34,33 @@ stop_linkwatch() {
     rm -f /var/run/e3372-linkwatch.pid
 }
 
+# Tell connman to leave the modem's interface alone. Each time it starts,
+# connman brings down every interface that is up and that it was not told to
+# ignore, and it restarts itself when a saved WiFi network goes out of range
+# ("service ... stuck in failed state, restarting"). wwan0 lost its address
+# that way: about a minute without the link, until the service noticed and
+# ran DHCP again. Venus OS already lists the interface of its own modems
+# (ppp) on that line; wwan joins it. connman reads the file when it starts,
+# and it is not restarted here: that would cut WiFi and Ethernet under
+# whoever is installing. A main.conf without the line is left alone - this
+# must never fail an install.
+CONNMAN_CONF=/etc/connman/main.conf
+connman_has_wwan() {
+    grep -q '^NetworkInterfaceBlacklist=\(.*,\)\{0,1\}wwan\(,.*\)\{0,1\}$' "$CONNMAN_CONF" 2>/dev/null
+}
+connman_ignore_wwan() {
+    grep -q '^NetworkInterfaceBlacklist=' "$CONNMAN_CONF" 2>/dev/null || return 1
+    connman_has_wwan && return 0
+    sed -i -e 's/^NetworkInterfaceBlacklist=[ 	]*$/NetworkInterfaceBlacklist=wwan/' \
+           -e '/^NetworkInterfaceBlacklist=wwan$/!s/^\(NetworkInterfaceBlacklist=.*[^, 	]\)[, 	]*$/\1,wwan/' \
+        "$CONNMAN_CONF"
+    connman_has_wwan
+}
+connman_unignore_wwan() {
+    connman_has_wwan || return 0
+    sed -i -e '/^NetworkInterfaceBlacklist=/{s/,wwan,/,/;s/,wwan$//;s/=wwan,/=/;s/=wwan$/=/;}' "$CONNMAN_CONF"
+}
+
 #### running manually and target just install or uninstall
 if [ $scriptAction == 'NONE' ] ; then
     echo
@@ -50,6 +78,13 @@ if [ $scriptAction == 'INSTALL' ] ; then
     ln -sf /data/udev-e3372.rules /etc/udev/rules.d/99-e3372.rules
     udevadm control --reload-rules 2>/dev/null
     logMessage "udev rules installed"
+
+    # connman must not bring wwan0 down when it (re)starts
+    if connman_ignore_wwan ; then
+        logMessage "connman told to ignore wwan ($CONNMAN_CONF)"
+    else
+        logMessage "WARNING: no NetworkInterfaceBlacklist line in $CONNMAN_CONF, left untouched"
+    fi
 
     # Install the helpers into /data. Each one is written to a temporary file
     # and renamed into place: a copy that is running right now (the link
@@ -111,6 +146,10 @@ if [ $scriptAction == 'UNINSTALL' ] ; then
     rm -f /data/udev-e3372.rules
     udevadm control --reload-rules 2>/dev/null
     logMessage "udev rules removed"
+
+    # Give wwan back to connman
+    connman_unignore_wwan
+    logMessage "connman no longer told to ignore wwan"
 
     # Remove NCM connect script
     rm -f /data/e3372_connect.sh

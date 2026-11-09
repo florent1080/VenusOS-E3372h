@@ -1,3 +1,20 @@
+v1.8
+    Fix: the link dropped for about a minute, and DNS stayed broken, each
+        time a WiFi network went out of range (measured on 2026-11-09 when a
+        phone hotspot was switched off; Venus OS v3.85, connman 1.33).
+        - connman restarts itself in that case, and each time it starts it
+          brings down every interface it is not told to ignore: wwan0 lost
+          its address a second later. The install now adds "wwan" to
+          NetworkInterfaceBlacklist in /etc/connman/main.conf (Venus OS
+          already lists ppp there) and the uninstall removes it. A main.conf
+          without that line is left untouched and the install carries on.
+        - connman's resolv.conf went on naming the DNS server of the lost
+          network, and resolv-watch prefers that file: every lookup failed
+          over the modem link until the VRM watchdog rebooted the GX 75
+          minutes later. The link watchdog now empties that file when
+          connman reports it is connected to nothing (DNS_CLEANUP=1).
+        No Venus OS file is replaced: one word on one line of main.conf.
+
 v1.7
     Fix: no address on wwan0 under Venus OS v3.85. udhcpc only negotiates the
         lease; an event script applies it, and BusyBox looks for that script

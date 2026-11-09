@@ -17,6 +17,8 @@ Features:
 - Resident DHCP client: renews the lease and restores the default route,
   with its own event script (Venus OS v3.85 no longer ships BusyBox's)
 - Clock set over the link (NTP), which Venus does not do on 4G (see below)
+- Living next to connman: connman is told to leave wwan alone, and the DNS
+  servers it leaves behind after a WiFi network is lost are cleared (see below)
 - Automatic hotplug: reconnects on USB replug
 - Configurable APN via /data/e3372-config.conf
 - Compatible with serial-starter and Venus OS GUI
@@ -48,6 +50,7 @@ Edit /data/e3372-config.conf:
   TIMESYNC=1                   (set the clock over the link, see below)
   TIMESYNC_INTERVAL=3600       (seconds between two syncs)
   TIMESYNC_SERVERS=pool.ntp.org,time.cloudflare.com,time.google.com
+  DNS_CLEANUP=1                (clear connman's stale DNS servers, see below)
   RECOVERY_TIMESCALE=1.0       (tests only: shortens every recovery delay)
 
 PROBE_HOST hosts are pinged every 2 minutes through wwan0; the check passes
@@ -150,6 +153,28 @@ metric 10 (a WiFi or Ethernet connection managed by connman keeps priority)
 and writes the DNS servers to /run/ppp/resolv.conf, the file Venus OS uses for
 its cellular uplink: resolv-watch points the local dnsmasq at it whenever
 connman has no DNS server of its own.
+
+Next to connman:
+connman manages WiFi and Ethernet on Venus OS; wwan0 is brought up by this
+package. Two things connman does when a WiFi network goes out of range broke
+the modem link on 2026-11-09 (a phone hotspot was switched off):
+
+- It restarts itself ("service ... stuck in failed state, restarting"), and
+  each time connman starts it brings down every interface that is up and that
+  it was not told to ignore. wwan0 lost its address within a second, and the
+  link was gone for about a minute, until the service noticed and ran DHCP
+  again. The install therefore adds "wwan" to NetworkInterfaceBlacklist in
+  /etc/connman/main.conf, next to "ppp", the interface of Venus OS's own
+  modems; the uninstall removes it. connman reads the file when it starts.
+- Its resolv.conf went on naming the DNS server of the network that was
+  gone. resolv-watch prefers connman's file whenever it names a server, so
+  every lookup failed over the modem link - VRM included - until the VRM
+  watchdog rebooted the GX 75 minutes later. The link watchdog now asks
+  connman for its state once a minute while the link is up: when connman
+  says it is connected to nothing ("idle" or "offline") and its file still
+  names a server, the file is emptied and resolv-watch falls back to the
+  servers of the modem link. A connman that does not answer is left alone.
+  DNS_CLEANUP=0 disables it; it also stops with LINKWATCH=0.
 
 A PIN or PUK request, a wrong SIM, or roaming while roaming is not permitted
 are reported but never acted upon. When a whole ladder fails, the next one

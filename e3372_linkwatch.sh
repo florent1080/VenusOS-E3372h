@@ -19,7 +19,8 @@
 # It never reboots the GX.
 #
 # Being the one process that runs for as long as the link exists, it also
-# keeps the clock right (role 2 below): nothing else does on a 4G-only GX.
+# keeps the clock right (role 2 below) and clears the DNS servers connman
+# leaves behind (role 3): nothing else does on a 4G-only GX.
 
 CONF=/data/e3372-config.conf
 LOG=/data/log/e3372/linkwatch.log
@@ -32,6 +33,7 @@ UPTIME_FILE=/proc/uptime
 USB_RESET=/data/e3372_usb_reset.sh
 AT=/data/e3372_at.py
 TIMESYNC=/data/e3372_timesync.py
+CM_RESOLV=/run/connman/resolv.conf
 IFACE=wwan0
 
 CHECK_INTERVAL=60          # seconds between checks
@@ -43,6 +45,7 @@ HCI_RESET=1                # the controller carrying the modem only
 TIMESYNC_ON=1              # set the clock over the link
 TIMESYNC_EVERY=3600        # between two syncs once one has worked
 TIMESYNC_RETRY=120         # after a sync that failed
+DNS_CLEANUP=1              # clear the DNS servers a disconnected connman left
 
 mkdir -p /data/log/e3372 2>/dev/null
 say() { echo "$(date) [$(cut -d. -f1 "$UPTIME_FILE" 2>/dev/null)] - $*" >> "$LOG"; }
@@ -65,6 +68,7 @@ conf_get() {
     HCI_RESET=$(conf_get LINKWATCH_HCI_RESET "$HCI_RESET")
     TIMESYNC_ON=$(conf_get TIMESYNC "$TIMESYNC_ON")
     TIMESYNC_EVERY=$(conf_get TIMESYNC_INTERVAL "$TIMESYNC_EVERY")
+    DNS_CLEANUP=$(conf_get DNS_CLEANUP "$DNS_CLEANUP")
 }
 
 now_s() { cut -d. -f1 "$UPTIME_FILE"; }   # monotonic: the wall clock can be decades off at boot
@@ -171,6 +175,37 @@ sync_clock() {
     fi
 }
 
+# Role 3: clear the DNS servers connman left behind. Venus OS's resolv-watch
+# hands dnsmasq connman's resolv.conf whenever that file names a server, and
+# the one written for this link (/run/ppp/resolv.conf) only otherwise. Seen
+# on 2026-11-09 after a WiFi network went out of range: connman restarted
+# itself ("service ... stuck in failed state, restarting") and its file went
+# on naming the DNS server of the network that was gone. The default route
+# was back on wwan0 and every lookup failed, VRM included, until the VRM
+# watchdog rebooted the GX 75 minutes later. connman's own state is the
+# judge: when it says it is connected to nothing, any server left in its
+# file is stale. No answer from connman (it is restarting, or absent) is not
+# a reason to touch anything.
+connman_state() {
+    dbus-send --system --print-reply --dest=net.connman / \
+        net.connman.Manager.GetProperties 2>/dev/null \
+        | sed -n '/string "State"/{n;s/.*string "\([a-z]*\)".*/\1/p;}' | head -n 1
+}
+
+drop_stale_dns() {
+    [ "$DNS_CLEANUP" = "1" ] || return 0
+    grep -q '^nameserver' "$CM_RESOLV" 2>/dev/null || return 0
+    state=$(connman_state)
+    case "$state" in
+        idle|offline) ;;
+        *) return 0 ;;
+    esac
+    stale=$(sed -n 's/^nameserver[ 	]*//p' "$CM_RESOLV" | tr '\n' ' ')
+    say "connman is $state but its resolv.conf still names ${stale}- clearing it"
+    # Truncated in place, not replaced: resolv-watch waits for close_write.
+    : > "$CM_RESOLV"
+}
+
 # --- single instance -------------------------------------------------------
 # The pidfile is the lock. Until v1.5 the TERM trap removed it and then let
 # the script carry on, so every 'kill' left a running watchdog without a lock
@@ -217,7 +252,7 @@ fi
 [ "$(conf_get LINKWATCH 1)" = "0" ] && exit 0
 acquire_instance || exit 0
 
-say "linkwatch started (pid $$, first action after ${STEP1_AFTER}s, hci_reset=$HCI_RESET, timesync=$TIMESYNC_ON)"
+say "linkwatch started (pid $$, first action after ${STEP1_AFTER}s, hci_reset=$HCI_RESET, timesync=$TIMESYNC_ON, dns_cleanup=$DNS_CLEANUP)"
 
 next_sync=0
 down_since=0
@@ -248,6 +283,7 @@ while true; do
         if [ "$step" != 0 ] && [ $((now - last_step_at)) -ge 3600 ]; then
             step=0; backoff=0
         fi
+        drop_stale_dns
         sync_clock
         continue
     fi

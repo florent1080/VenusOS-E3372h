@@ -42,7 +42,7 @@ import dbus.mainloop.glib
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = '1.7-e3372'
+VERSION = '1.8-e3372'
 
 CONFIG_FILE = '/data/e3372-config.conf'
 IFACE = 'wwan0'

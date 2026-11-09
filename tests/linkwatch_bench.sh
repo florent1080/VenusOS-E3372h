@@ -283,6 +283,118 @@ printf 'TIMESYNC=0\nTIMESYNC_INTERVAL=900\r\n' > "$TMP/data/e3372-config.conf"
 check "TIMESYNC is read from the config" "$(conf_get TIMESYNC 1)" "0"
 check "TIMESYNC_INTERVAL is read from the config" "$(conf_get TIMESYNC_INTERVAL 3600)" "900"
 
+# --- 8b. the DNS servers a disconnected connman left behind are cleared ----
+# resolv-watch prefers connman's file whenever it names a server. On
+# 2026-11-09 it still named the DNS server of a WiFi network that was gone:
+# every lookup failed over the modem link for 75 minutes.
+setup
+load_watchdog
+CM_RESOLV="$TMP/run/connman-resolv.conf"
+# The real dbus-send, replaced by a stub that prints what connman answers.
+cat > "$TMP/bin/dbus-send" <<EOF
+#!/bin/sh
+[ -f "$TMP/connman_down" ] && exit 1
+cat <<REPLY
+method return time=1794258287.1 sender=:1.5 -> destination=:1.99 serial=7 reply_serial=2
+   array [
+      dict entry(
+         string "State"
+         variant             string "\$(cat "$TMP/connman_state")"
+      )
+      dict entry(
+         string "OfflineMode"
+         variant             boolean false
+      )
+   ]
+REPLY
+EOF
+chmod +x "$TMP/bin/dbus-send"
+OLD_PATH=$PATH
+PATH="$TMP/bin:$PATH"
+stale_file() { printf 'nameserver fe80::1234\nnameserver 192.168.43.1\n' > "$CM_RESOLV"; }
+servers() { grep -c '^nameserver' "$CM_RESOLV" | tr -d ' '; }
+
+printf 'idle\n' > "$TMP/connman_state"
+check "connman's state is read from its D-Bus answer" "$(connman_state)" "idle"
+stale_file; drop_stale_dns
+check "servers left by an idle connman are cleared" "$(servers)" "0"
+[ -f "$CM_RESOLV" ] && ok "the file itself is kept (truncated in place)" || bad "the file was removed"
+grep -q 'still names fe80::1234 192.168.43.1 - clearing' "$LOG" && ok "the cleanup is logged with the servers dropped" \
+    || bad "the cleanup is not logged"
+printf 'offline\n' > "$TMP/connman_state"
+stale_file; drop_stale_dns
+check "servers left by an offline connman are cleared" "$(servers)" "0"
+for st in ready online association configuration; do
+    printf '%s\n' "$st" > "$TMP/connman_state"
+    stale_file; drop_stale_dns
+    check "a connman that is '$st' keeps its servers" "$(servers)" "2"
+done
+: > "$TMP/connman_down"
+stale_file; drop_stale_dns
+check "no answer from connman changes nothing" "$(servers)" "2"
+rm -f "$TMP/connman_down"
+printf 'idle\n' > "$TMP/connman_state"
+DNS_CLEANUP=0; stale_file; drop_stale_dns
+check "DNS_CLEANUP=0 changes nothing" "$(servers)" "2"
+DNS_CLEANUP=1
+lines_before=$(wc -l < "$LOG" | tr -d ' ')
+: > "$CM_RESOLV"; drop_stale_dns
+check "an empty file is left alone, silently" "$(wc -l < "$LOG" | tr -d ' ')" "$lines_before"
+rm -f "$CM_RESOLV"; drop_stale_dns
+[ -f "$CM_RESOLV" ] && bad "a missing file was created" || ok "a missing file is not created"
+PATH=$OLD_PATH
+printf 'DNS_CLEANUP=0\r\n' > "$TMP/data/e3372-config.conf"
+check "DNS_CLEANUP is read from the config" "$(conf_get DNS_CLEANUP 1)" "0"
+grep -q 'drop_stale_dns$' "$PKG/e3372_linkwatch.sh" && ok "the main loop calls the cleanup while the link is alive" \
+    || bad "the main loop never calls the cleanup"
+
+# --- 8c. setup tells connman to ignore wwan, and takes it back ------------
+# connman brings down every interface it is not told to ignore each time it
+# starts: wwan0 lost its address a second after connman restarted itself.
+eval "$(sed -n '/^connman_has_wwan() {/,/^}/p; /^connman_ignore_wwan() {/,/^}/p; /^connman_unignore_wwan() {/,/^}/p' "$PKG/setup")"
+CONNMAN_CONF="$TMP/main.conf"
+bl() { sed -n 's/^NetworkInterfaceBlacklist=//p' "$CONNMAN_CONF"; }
+venus_conf() {
+    printf '[General]\nPreferredTechnologies=ethernet,wifi,cellular\nFavoriteMaxRetries=-1\nNetworkInterfaceBlacklist=%s\nEnableIPv4LL=false\n' "$1" > "$CONNMAN_CONF"
+}
+venus_conf 'ppp,ap,disabled,ll'
+cp "$CONNMAN_CONF" "$TMP/main.conf.stock"
+connman_ignore_wwan; rc=$?
+check "wwan is appended to Venus OS's list" "$(bl)" "ppp,ap,disabled,ll,wwan"
+check "and that is reported as done" "$rc" "0"
+check "no other line of main.conf changes" "$(grep -v '^NetworkInterfaceBlacklist=' "$CONNMAN_CONF" | cksum)" \
+      "$(grep -v '^NetworkInterfaceBlacklist=' "$TMP/main.conf.stock" | cksum)"
+connman_ignore_wwan
+check "a second install adds nothing" "$(bl)" "ppp,ap,disabled,ll,wwan"
+connman_unignore_wwan
+if cmp -s "$CONNMAN_CONF" "$TMP/main.conf.stock"; then ok "uninstall gives back the stock file, byte for byte"
+else bad "uninstall does not give back the stock file"; fi
+connman_unignore_wwan
+check "a second uninstall changes nothing" "$(bl)" "ppp,ap,disabled,ll"
+venus_conf 'ppp,wwan,ll'; connman_ignore_wwan
+check "wwan already in the middle is left as it is" "$(bl)" "ppp,wwan,ll"
+connman_unignore_wwan
+check "and is removed from the middle" "$(bl)" "ppp,ll"
+venus_conf 'ppp,wwanfoo'; connman_ignore_wwan
+check "a longer name is not taken for wwan" "$(bl)" "ppp,wwanfoo,wwan"
+connman_unignore_wwan
+check "and only wwan itself is removed" "$(bl)" "ppp,wwanfoo"
+venus_conf 'ppp,ll,'; connman_ignore_wwan
+check "a trailing comma is absorbed" "$(bl)" "ppp,ll,wwan"
+venus_conf ''; connman_ignore_wwan
+check "an empty list becomes wwan" "$(bl)" "wwan"
+connman_unignore_wwan
+check "and is emptied again" "$(bl)" ""
+printf '[General]\nFavoriteMaxRetries=-1\n' > "$CONNMAN_CONF"
+cp "$CONNMAN_CONF" "$TMP/main.conf.stock"
+if connman_ignore_wwan; then bad "a file without the line is reported as done"
+else ok "a file without the line is reported, not treated as done"; fi
+if cmp -s "$CONNMAN_CONF" "$TMP/main.conf.stock"; then ok "and it is left untouched"; else bad "and it was modified"; fi
+CONNMAN_CONF="$TMP/missing.conf"
+if connman_ignore_wwan; then bad "a missing file is reported as done"; else ok "a missing file is reported"; fi
+connman_unignore_wwan
+[ -e "$CONNMAN_CONF" ] && bad "a missing file was created" || ok "a missing file is not created"
+
 echo
 echo "== source-level guarantees =="
 
