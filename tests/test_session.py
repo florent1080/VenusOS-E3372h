@@ -35,6 +35,17 @@ class SessionTests(unittest.TestCase):
         # DHCP was (re)started after the session came up
         self.assertTrue(any(c[1] == 'sh' and c[2].startswith('udhcpc') for c in b.system.calls))
 
+    def test_dhcp_client_names_its_event_script(self):
+        """Venus OS v3.85 has no /usr/share/udhcpc/default.script: a udhcpc
+        started without -s gets its lease and never applies it."""
+        b = harness.Bench()
+        b.start()
+        b.run(60)
+        starts = [c[2] for c in b.system.calls if c[1] == 'sh' and c[2].startswith('udhcpc')]
+        self.assertTrue(starts)
+        for cmd in starts:
+            self.assertIn(' -s /data/e3372_udhcpc.sh ', cmd)
+
     def test_dial_failures_escalate_to_the_ladder(self):
         b = harness.Bench()
         b.modem.ndisdup_auto_up = False

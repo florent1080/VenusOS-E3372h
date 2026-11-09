@@ -1,3 +1,19 @@
+v1.7
+    Fix: no address on wwan0 under Venus OS v3.85. udhcpc only negotiates the
+        lease; an event script applies it, and BusyBox looks for that script
+        at /usr/share/udhcpc/default.script, which v3.85 no longer ships
+        (/etc/udhcpc.d/ only holds avahi's hooks). After the update of
+        2026-11-06 the modem registered and dialled, udhcpc got its lease
+        within a second, nothing applied it, and the GX stayed offline for
+        two days while the recovery ladder reset a healthy modem in a loop.
+        The package now ships /data/e3372_udhcpc.sh and every udhcpc it
+        starts (service, connect script, HiLink udev rule) names it with -s.
+        Same behaviour as Yocto's simple.script (address, default route at
+        metric 10), except that the DNS servers go to /run/ppp/resolv.conf,
+        which Venus OS's resolv-watch hands to dnsmasq when connman has none,
+        instead of overwriting /etc/resolv.conf and the dnsmasq proxy.
+        Validated on the van (Pi 5, v3.85): address, route, DNS file, traffic.
+
 v1.6
     New: the clock is set over the link. Venus OS gets its time from
         connman's NTP client, which only runs while connman has a service of

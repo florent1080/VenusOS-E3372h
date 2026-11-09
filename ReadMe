@@ -14,7 +14,8 @@ Features:
 - Recovery ladder: gets the modem back from every state in which it cannot
   be dialled (see below). The GX itself is never rebooted.
 - SIM PIN entry from the GUI (/Settings/Modem/PIN)
-- Resident DHCP client: renews the lease and restores the default route
+- Resident DHCP client: renews the lease and restores the default route,
+  with its own event script (Venus OS v3.85 no longer ships BusyBox's)
 - Clock set over the link (NTP), which Venus does not do on 4G (see below)
 - Automatic hotplug: reconnects on USB replug
 - Configurable APN via /data/e3372-config.conf
@@ -139,6 +140,17 @@ that a reboot (not a power cut) starts on the right time. It only logs a
 step, the first failure of a series and the first sync after a boot.
 TIMESYNC=0 disables it; it also stops with LINKWATCH=0.
 
+DHCP on wwan0:
+udhcpc negotiates the lease and hands it to an event script that applies it.
+BusyBox looks for that script at /usr/share/udhcpc/default.script, which
+Venus OS v3.85 no longer ships: the lease was obtained and never applied, and
+wwan0 stayed without an address. Every udhcpc this package starts therefore
+names /data/e3372_udhcpc.sh with -s. It sets the address, a default route at
+metric 10 (a WiFi or Ethernet connection managed by connman keeps priority)
+and writes the DNS servers to /run/ppp/resolv.conf, the file Venus OS uses for
+its cellular uplink: resolv-watch points the local dnsmasq at it whenever
+connman has no DNS server of its own.
+
 A PIN or PUK request, a wrong SIM, or roaming while roaming is not permitted
 are reported but never acted upon. When a whole ladder fails, the next one
 waits 15 minutes, then 30, 1 hour, 2 hours, up to 4 hours, forever: the
@@ -187,5 +199,6 @@ and a shell bench that runs the real helpers against a fake sysfs tree:
   sh tests/linkwatch_bench.sh
 
 Tested on:
-- Raspberry Pi 5 with Venus OS v3.75 (Bouygues Telecom, APN mmsbouygtel.com)
+- Raspberry Pi 5 with Venus OS v3.75 and v3.85 (Bouygues Telecom, APN
+  mmsbouygtel.com)
 - Raspberry Pi 3 Model B with Venus OS v3.72

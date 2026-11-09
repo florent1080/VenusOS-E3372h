@@ -10,6 +10,7 @@
 #   - NCM connect script
 #   - USB reset helper and link watchdog (recovery ladder)
 #   - NTP clock setter over the link, run by the link watchdog
+#   - udhcpc event script that applies the lease on wwan0
 #   - Default config file (preserves existing)
 
 packageDir="$(dirname "$(realpath "$0")")"
@@ -66,6 +67,7 @@ if [ $scriptAction == 'INSTALL' ] ; then
     install_helper e3372_linkwatch.sh   # last-resort watchdog, runs detached
     install_helper e3372_at.py          # AT queries on the second channel
     install_helper e3372_timesync.py    # clock over the link, run by the watchdog
+    install_helper e3372_udhcpc.sh      # applies the DHCP lease (udhcpc -s)
     logMessage "helpers installed"
 
     # Restart the link watchdog on the new code: a running copy would carry
@@ -117,7 +119,8 @@ if [ $scriptAction == 'UNINSTALL' ] ; then
     # Remove the helpers (the recovery journal in /data/log/e3372 is kept)
     stop_linkwatch
     rm -f /data/e3372_usb_reset.sh /data/e3372_linkwatch.sh /data/e3372_at.py /data/e3372_timesync.py
-    logMessage "USB reset helper, link watchdog and clock setter removed"
+    rm -f /data/e3372_udhcpc.sh
+    logMessage "USB reset helper, link watchdog, clock setter and DHCP script removed"
 
     # Note: /data/e3372-config.conf is NOT removed (user data)
     logMessage "config file preserved (/data/e3372-config.conf)"

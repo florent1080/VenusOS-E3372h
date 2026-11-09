@@ -10,4 +10,4 @@ ACTION=="add", SUBSYSTEM=="net", ENV{ID_USB_DRIVER}=="huawei_cdc_ncm", RUN+="/bi
 # When net interface appears for E3372 HiLink mode -> just DHCP.
 # No -q: the client must stay resident to renew the lease and to restore the
 # address and default route after a session drop.
-ACTION=="add", SUBSYSTEM=="net", ATTRS{idVendor}=="12d1", ATTRS{idProduct}=="14dc", RUN+="/bin/sh -c 'sleep 3; udhcpc -i %k -b -p /var/run/udhcpc.%k.pid -t 8 -T 3 -A 15 > /dev/null 2>&1 &'"
+ACTION=="add", SUBSYSTEM=="net", ATTRS{idVendor}=="12d1", ATTRS{idProduct}=="14dc", RUN+="/bin/sh -c 'sleep 3; udhcpc -i %k -b -p /var/run/udhcpc.%k.pid -t 8 -T 3 -A 15 -s /data/e3372_udhcpc.sh > /dev/null 2>&1 &'"

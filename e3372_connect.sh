@@ -64,7 +64,8 @@ if [ -n "$running" ]; then
     echo "$(date) - udhcpc already running on $IFACE (pid$running)"
 else
     rm -f "$PIDFILE"
-    udhcpc -i "$IFACE" -b -p "$PIDFILE" -t 8 -T 3 -A 15 > /dev/null 2>&1 &
+    # -s: the image's default event script is gone since Venus OS v3.85
+    udhcpc -i "$IFACE" -b -p "$PIDFILE" -t 8 -T 3 -A 15 -s /data/e3372_udhcpc.sh > /dev/null 2>&1 &
     echo "$(date) - udhcpc started on $IFACE"
     sleep 5
 fi

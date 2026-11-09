@@ -42,11 +42,15 @@ import dbus.mainloop.glib
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = '1.5-e3372'
+VERSION = '1.7-e3372'
 
 CONFIG_FILE = '/data/e3372-config.conf'
 IFACE = 'wwan0'
 DHCP_PIDFILE = '/var/run/udhcpc.wwan0.pid'
+# udhcpc event script that applies the lease. Always named with -s: Venus OS
+# v3.85 no longer ships BusyBox's default one, and without it the lease is
+# obtained but never applied (no address on wwan0).
+DHCP_SCRIPT = '/data/e3372_udhcpc.sh'
 WDM_DEV = '/dev/cdc-wdm0'
 STATE_FILE = '/run/e3372-recovery.json'
 USB_RESET_HELPER = '/data/e3372_usb_reset.sh'
@@ -1355,8 +1359,8 @@ class ModemService:
         self.dhcp_started_at = now
         log.info('starting udhcpc on %s', IFACE)
         # No -q: udhcpc stays resident and renews the lease.
-        self.sysx.sh('udhcpc -i %s -b -p %s -t 8 -T 3 -A 15 >/dev/null 2>&1 &'
-                     % (IFACE, DHCP_PIDFILE))
+        self.sysx.sh('udhcpc -i %s -b -p %s -t 8 -T 3 -A 15 -s %s >/dev/null 2>&1 &'
+                     % (IFACE, DHCP_PIDFILE, DHCP_SCRIPT))
 
     def _stop_dhcp(self):
         for pid in self._dhcp_pids():
